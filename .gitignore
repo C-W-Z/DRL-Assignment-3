@@ -1,4 +1,12 @@
+*__pycache__*
+
 # venv folder
 drl-hw3
 
+ll
+models
+
 *test*
+*log*
+*rainbow*
+convert.py

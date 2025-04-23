@@ -6,3 +6,6 @@ argparse
 numpy==1.23.5
 gym==0.23.1
 gym_super_mario_bros
+numba
+opencv-python
+matplotlib
