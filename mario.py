@@ -1,8 +1,9 @@
 import math
 import os
 import random
+import pickle
 from collections import deque
-from typing import Deque, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import gym
 import gym_super_mario_bros
@@ -18,7 +19,7 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import numba
 import cv2
-import collections
+# import collections
 
 from segment_tree import SumSegmentTree, MinSegmentTree
 
@@ -30,11 +31,11 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-# 環境預處理 Wrapper（從 DoubleDQN_MarioBros.ipynb 借用）
+# 環境預處理 Wrapper
 class SkipAndMax(gym.Wrapper):
     def __init__(self, env=None, skip=4):
         super(SkipAndMax, self).__init__(env)
-        self.obs_buffer = collections.deque(maxlen=2)
+        self.obs_buffer = deque(maxlen=2)
         self._skip = skip
 
     def step(self, action):
@@ -63,8 +64,7 @@ class Frame_Processing(gym.ObservationWrapper):
                                                 dtype=np.float32)
 
     def observation(self, obs):
-        obs = Frame_Processing.process(obs)
-        return np.moveaxis(obs, 2, 0)
+        return Frame_Processing.process(obs)
 
     @staticmethod
     def process(frame):
@@ -75,8 +75,8 @@ class Frame_Processing(gym.ObservationWrapper):
         img = img[:, :, 0] * 0.299 + img[:, :, 1] * 0.587 + img[:, :, 2] * 0.114
         resized_screen = cv2.resize(img, (84, 110), interpolation=cv2.INTER_AREA)
         x_t = resized_screen[18:102, :]
-        x_t = np.reshape(x_t, [84, 84, 1])
-        return x_t.astype(np.uint8)
+        x_t = np.reshape(x_t, [84, 84, 1]).astype(np.uint8)
+        return np.moveaxis(x_t, 2, 0)
 
 class BufferingWrapper(gym.ObservationWrapper):
     def __init__(self, env, n_steps, dtype=np.float32):
@@ -95,11 +95,139 @@ class BufferingWrapper(gym.ObservationWrapper):
         self.buffer[-1] = observation
         return np.array(self.buffer).astype(np.float32) / 255.0
 
+class CustomReward(gym.Wrapper):
+
+    def __init__(self, env):
+        super(CustomReward, self).__init__(env)
+        self._current_score = 0
+        self._current_life = 2
+
+    def reset(self):
+        self._current_score = 0
+        self._current_life = 2
+        return self.env.reset()
+
+    def step(self, action):
+        state, reward, done, info = self.env.step(action)
+
+        # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
+
+        score = info["score"]
+        life = info["life"]
+
+        if reward <= 0:
+            reward -= 0.1
+        # reward *= 10
+
+        reward += (score - self._current_score) / 50
+
+        if life < self._current_life:
+            reward -= 50
+
+        self._current_score = score
+        self._current_life = life
+
+        if info["flag_get"]:
+            reward += 500
+
+        return state, reward, done, info
+
+# class CustomReward(gym.Wrapper):
+
+#     def __init__(self, env):
+#         super(CustomReward, self).__init__(env)
+#         self._current_score = 0
+#         self._max_x_pos = 0
+#         self._current_time = 400
+#         self._current_life = 2
+#         self._current_coins = 0
+#         self._current_status = 'small'
+
+#     def reset(self):
+#         # 重置環境時，重置所有狀態
+#         self._current_score = 0
+#         self._max_x_pos = 0
+#         self._current_time = 400
+#         self._current_life = 2
+#         self._current_coins = 0
+#         self._current_status = 'small'
+#         return self.env.reset()
+
+#     def step(self, action):
+#         state, reward, done, info = self.env.step(action)
+
+#         # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
+
+#         # 提取 info 中的資訊
+#         x_pos = info["x_pos"]
+#         time = info["time"]
+#         life = info["life"]
+#         score = info["score"]
+#         coins = info["coins"]
+#         flag_get = info["flag_get"]
+#         status = info["status"]
+
+#         # 初始化總獎勵
+#         total_reward = 0.0
+
+#         # 1. 前進獎勵 (v): 根據 x_pos 的變化
+#         v = max(0, x_pos - self._max_x_pos) * 2  # 縮放係數 0.1
+#         total_reward += v
+
+#         # 2. 時間懲罰 (c): 根據 time 的變化
+#         c = (self._current_time - time) * -1  # 每減少 1 單位時間，懲罰 -0.5
+#         total_reward += c
+
+#         # 3. 死亡懲罰 (d): 根據 life 的減少
+#         d = 0
+#         if life < self._current_life:  # 生命減少表示死亡
+#             d = -50  # 死亡懲罰
+#         total_reward += d
+
+#         # 4. 分數增量 (s): 根據 score 的增量
+#         s = (score - self._current_score) * 0.5  # 縮放係數 0.1
+#         total_reward += s
+
+#         # 5. 硬幣獎勵 (coin): 根據 coins 的增量
+#         coin = (coins - self._current_coins) * 20  # 每收集 1 個硬幣獎勵 10
+#         total_reward += coin
+
+#         # 6. 終點獎勵 (flag): 如果到達終點旗幟
+#         if flag_get:
+#             total_reward += 150  # 到達終點獎勵
+
+#         # 7. 狀態獎勵 (status): 根據 Mario 狀態的變化
+#         status_reward = 0
+#         status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
+#         current_status_value = status_map.get(self._current_status, 0)
+#         new_status_value = status_map.get(status, 0)
+#         if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
+#             status_reward = 50  # 狀態提升獎勵
+#         elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
+#             status_reward = -20  # 狀態下降懲罰
+#         total_reward += status_reward
+
+#         # 裁剪獎勵到 [-50, 50] 範圍，避免過大或過小的值
+#         total_reward = np.clip(total_reward / 10, -15, 15)
+
+#         # total_reward += reward
+
+#         # 更新當前狀態
+#         self._max_x_pos = max(self._max_x_pos, x_pos)
+#         self._current_time = time
+#         self._current_life = life
+#         self._current_score = score
+#         self._current_coins = coins
+#         self._current_status = status
+
+#         return state, total_reward, done, info
+
 def make_env(env):
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = SkipAndMax(env, skip=4)
     env = Frame_Processing(env)
     env = BufferingWrapper(env, n_steps=4)
+    env = CustomReward(env)
     return env
 
 # 2. Replay Buffer（基礎 N-step Buffer，使用 numba 加速）
@@ -289,8 +417,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             'n_step_buffer': self.n_step_buffer,
             'n_step_buffer_idx': self.n_step_buffer_idx,
             'n_step_buffer_full': self.n_step_buffer_full,
-            'sum_tree_values': self.sum_tree.values,
-            'min_tree_values': self.min_tree.values,
+            'sum_tree_tree': self.sum_tree.tree,
+            'min_tree_tree': self.min_tree.tree,
             'tree_ptr': self.tree_ptr,
             'max_priority': self.max_priority,
         }
@@ -307,8 +435,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self.n_step_buffer = state['n_step_buffer']
         self.n_step_buffer_idx = state['n_step_buffer_idx']
         self.n_step_buffer_full = state['n_step_buffer_full']
-        self.sum_tree.values = state['sum_tree_values']
-        self.min_tree.values = state['min_tree_values']
+        self.sum_tree.tree = state['sum_tree_tree']
+        self.min_tree.tree = state['min_tree_tree']
         self.tree_ptr = state['tree_ptr']
         self.max_priority = state['max_priority']
 
@@ -410,7 +538,7 @@ class RainbowDQNAgent:
         memory_size: int,
         batch_size: int,
         target_update: int,
-        seed: int,
+        seed: int = -1,
         gamma: float = 0.99,
         alpha: float = 0.6,
         beta: float = 0.4,
@@ -423,8 +551,10 @@ class RainbowDQNAgent:
         lr: float = 0.0001,
         avg_window_size: int = 100,
         model_save_dir: str = "./models",
+        plot_dir: str = "./plots",
     ):
-        set_seed(seed)
+        if seed >= 0:
+            set_seed(seed)
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         obs_shape = env.observation_space.shape  # (4, 84, 84)
@@ -444,6 +574,7 @@ class RainbowDQNAgent:
         self.prior_eps = prior_eps
         self.tau = tau
         self.model_save_dir = model_save_dir
+        self.plot_dir = plot_dir
 
         self.beta = beta
         self.beta_increment = (1.0 - beta) / 1000000
@@ -544,8 +675,12 @@ class RainbowDQNAgent:
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
     def save_model(self, path: str):
-        checkpoint = {
-            'dqn_state_dict': self.dqn.state_dict(),
+        # 保存權重和優化器狀態
+        torch.save(self.dqn.state_dict(), path)
+
+        # 保存其他數據到單獨的文件
+        metadata_path = path.replace('.pth', '_metadata.pkl')
+        metadata = {
             'dqn_target_state_dict': self.dqn_target.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'rewards': self.rewards,
@@ -555,29 +690,41 @@ class RainbowDQNAgent:
             'beta': self.beta,
             'episode': self.episode,
             'best_avg_reward': self.best_avg_reward,
-            'memory_state': self.memory.get_state(),  # 保存 ReplayBuffer 狀態
+            'memory_state': self.memory.get_state(),
         }
-        torch.save(checkpoint, path)
-        print(f"Model saved to {path}")
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(metadata, f)
+        print(f"Model saved to {path}, metadata saved to {metadata_path}")
 
-    def load_model(self, path):
+    def load_model(self, path, eval_mode=False):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file {path} not found")
 
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.dqn.load_state_dict(checkpoint['dqn_state_dict'])
-        # self.dqn_target.load_state_dict(checkpoint['dqn_target_state_dict'])
-        # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        # self.rewards = checkpoint['rewards']
-        # self.losses = checkpoint['losses']
-        # self.total_steps = checkpoint['total_steps']
-        # self.update_count = checkpoint['update_count']
-        # self.beta = checkpoint['beta']
-        # self.episode = checkpoint['episode']
-        # self.best_avg_reward = checkpoint['best_avg_reward']
-        # self.memory.set_state(checkpoint['memory_state'])  # 載入 ReplayBuffer 狀態
+        # 載入權重
+        self.dqn.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+        if eval_mode:
+            self.dqn.eval()
+            print(f"Model loaded from {path}")
+            return
 
-        print(f"Model loaded from {path}")
+        # 載入其他數據
+        metadata_path = path.replace('.pth', '_metadata.pkl')
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file {metadata_path} not found")
+        with open(metadata_path, 'rb') as f:
+            metadata = pickle.load(f)
+        self.dqn_target.load_state_dict(metadata['dqn_target_state_dict'])
+        self.optimizer.load_state_dict(metadata['optimizer_state_dict'])
+        self.rewards = metadata['rewards']
+        self.losses = metadata['losses']
+        self.total_steps = metadata['total_steps']
+        self.update_count = metadata['update_count']
+        self.beta = metadata['beta']
+        self.episode = metadata['episode']
+        self.best_avg_reward = metadata['best_avg_reward']
+        self.memory.set_state(metadata['memory_state'])
+
+        print(f"Model loaded from {path}, metadata loaded from {metadata_path}")
 
     def train(self, num_episodes: int, save_interval: int = 100, plot_interval: int = 10):
         self.dqn.train()
@@ -615,19 +762,19 @@ class RainbowDQNAgent:
                 frame_idx += 1
 
             self.rewards.append(episode_reward)
-            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.0f}")
+            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f}")
 
-            if self.episode >= self.avg_window_size:
-                avg_reward = np.mean(self.rewards[-self.avg_window_size:])
-                if avg_reward > self.best_avg_reward:
-                    self.best_avg_reward = avg_reward
-                    self.save_model(f"{self.model_save_dir}/Best{self.best_avg_reward:.0f}_Episode{self.episode}.pth")
+            # if self.episode >= self.avg_window_size:
+            #     avg_reward = np.mean(self.rewards[-self.avg_window_size:])
+            #     if avg_reward > self.best_avg_reward:
+            #         self.best_avg_reward = avg_reward
+            #         self.save_model(f"{self.model_save_dir}/Best{self.best_avg_reward:.0f}_Episode{self.episode}.pth")
 
             if self.episode % save_interval == 0:
                 self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
 
             if self.episode % plot_interval == 0:
-                self.plot(self.episode, plot_interval)
+                self.plot(self.episode)
 
         print(f"Best avg reward: {self.best_avg_reward}")
 
@@ -644,7 +791,12 @@ class RainbowDQNAgent:
         plt.subplot(122)
         plt.title("Loss")
         plt.plot(self.losses)
-        plt.show()
+        # plt.show()
+
+        save_path = os.path.join(self.plot_dir, f"episode_{episode}.png")
+        plt.savefig(save_path, bbox_inches='tight')
+        plt.close()  # 關閉圖表，避免記憶體洩漏
+        print(f"Plot saved to {save_path}")
 
 # 主程式
 if __name__ == "__main__":
@@ -655,22 +807,25 @@ if __name__ == "__main__":
 
     agent = RainbowDQNAgent(
         env=env,
-        memory_size=100000,
+        memory_size=10000,
         batch_size=128,
-        target_update=10000,
-        seed=777,
+        target_update=5000,
+        seed=1226,
         gamma=0.99,
         alpha=0.6,
         beta=0.4,
         prior_eps=1e-6,
-        v_min=-500.0,
-        v_max=5000.0,
+        v_min=-1000.0,
+        v_max=7000.0,
         atom_size=51,
-        n_step=3,
-        tau=0.9,
-        lr=0.0001,
+        n_step=5,
+        tau=0.85,
+        lr=0.00005,
+        avg_window_size=100,
         model_save_dir="./models",
+        plot_dir="./plots"
     )
 
-    agent.train(num_episodes=1000, save_interval=100, plot_interval=10)
+    agent.load_model("./models/Episode450.pth")
+    agent.train(num_episodes=1000, save_interval=10, plot_interval=10)
     env.close()
