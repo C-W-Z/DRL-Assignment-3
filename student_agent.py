@@ -23,7 +23,7 @@ class Agent(object):
         self.device = self.agent.device
 
         # 載入預訓練模型並優化
-        self.agent.load_model("./models/Episode610.pth", eval_mode=True)
+        self.agent.load_model("./models/Episode800.pth", eval_mode=True)
         self.agent.dqn = torch.jit.script(self.agent.dqn)  # 加速推理
 
         # Skipframe 參數
@@ -60,6 +60,10 @@ class Agent(object):
 
         # 使用 Frame_Processing 的 process 方法
         processed_obs = Frame_Processing.process(max_frame)  # 形狀：(1, 84, 84)
+
+        # if self.frame_count == 100:
+        #     cv2.imwrite("tmp.jpg", processed_obs[0])
+        #     exit(0)
 
         # 實現 skipframe 邏輯
         if self.frame_count % self.skip_frames == 0:

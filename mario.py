@@ -41,13 +41,16 @@ class SkipAndMax(gym.Wrapper):
     def step(self, action):
         total_reward = 0.0
         done = None
+        origin_reward = 0
         for _ in range(self._skip):
             obs, reward, done, info = self.env.step(action)
+            origin_reward += info.get('reward', 0)
             self.obs_buffer.append(obs)
             total_reward += reward
             if done:
                 break
         max_frame = np.max(np.stack(self.obs_buffer), axis=0)
+        info['reward'] = origin_reward
         return max_frame, total_reward, done, info
 
     def reset(self):
@@ -97,8 +100,9 @@ class BufferingWrapper(gym.ObservationWrapper):
 
 class CustomReward(gym.Wrapper):
 
-    def __init__(self, env):
+    def __init__(self, env, reward_shaping=True):
         super(CustomReward, self).__init__(env)
+        self.reward_shaping = reward_shaping
         self._current_score = 0
         self._current_life = 2
         self._current_time = 400
@@ -118,6 +122,9 @@ class CustomReward(gym.Wrapper):
     def step(self, action):
         state, reward, done, info = self.env.step(action)
 
+        # origin reward
+        info['reward'] = reward
+
         # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 400, 'world': 1, 'x_pos': 40, 'y_pos': 79}
 
         score = info["score"]
@@ -125,21 +132,23 @@ class CustomReward(gym.Wrapper):
         x_pos = info["x_pos"]
         coins = info['coins']
         status = info['status']
+        time = info['time']
 
-        if reward <= 0:
-            reward -= 0.1
-        # reward *= 10
+        shaped_reward = 0
 
         # 前進獎勵: 根據 x_pos 的增量
         if x_pos > self._max_x_pos:
             self._max_x_pos = x_pos
-            reward += (x_pos - self._max_x_pos) / 10
+            shaped_reward += (x_pos - self._max_x_pos) / 5
+        # 時間流逝
+        elif reward <= 0 and time < self._current_time:
+            shaped_reward -= 0.1
 
-        reward += (score - self._current_score) / 10
+        shaped_reward += (score - self._current_score) / 10
 
         # 硬幣獎勵 (coin): 根據 coins 的增量
         coin = (coins - self._current_coins) * 10  # 每收集 1 個硬幣獎勵 10
-        reward += coin
+        shaped_reward += coin
 
         # 狀態獎勵 (status): 根據 Mario 狀態的變化
         status_reward = 0
@@ -150,118 +159,34 @@ class CustomReward(gym.Wrapper):
             status_reward = 25  # 狀態提升獎勵
         elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
             status_reward = -10  # 狀態下降懲罰
-        reward += status_reward
+        shaped_reward += status_reward
 
-        if life < self._current_life or life == 255 or self._current_time == 0:
-            print("Died", self._current_time, self._max_x_pos)
-            reward -= 50
-            self._max_x_pos = 0
+        if life == 255:
+            life = -1
+        if life < self._current_life or done or (time == 0 and self._current_time > 0):
+            if self._current_time != 0:
+                print("Died", life, self._current_time, self._max_x_pos)
+                shaped_reward -= 50
+            self._max_x_pos = x_pos
+            info['end'] = True
             # print(info)
 
         self._current_score = score
         self._current_life = life
-        self._current_time = info['time']
+        self._current_time = time
         self._current_coins = coins
         self._current_status = status
 
         if info["flag_get"]:
-            reward += 500
+            shaped_reward += 500
 
-        return state, reward, done, info
-
-# class CustomReward(gym.Wrapper):
-
-#     def __init__(self, env):
-#         super(CustomReward, self).__init__(env)
-#         self._current_score = 0
-#         self._max_x_pos = 0
-#         self._current_time = 400
-#         self._current_life = 2
-#         self._current_coins = 0
-#         self._current_status = 'small'
-
-#     def reset(self):
-#         # 重置環境時，重置所有狀態
-#         self._current_score = 0
-#         self._max_x_pos = 0
-#         self._current_time = 400
-#         self._current_life = 2
-#         self._current_coins = 0
-#         self._current_status = 'small'
-#         return self.env.reset()
-
-#     def step(self, action):
-#         state, reward, done, info = self.env.step(action)
-
-#         # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
-
-#         # 提取 info 中的資訊
-#         x_pos = info["x_pos"]
-#         time = info["time"]
-#         life = info["life"]
-#         score = info["score"]
-#         coins = info["coins"]
-#         flag_get = info["flag_get"]
-#         status = info["status"]
-
-#         # 初始化總獎勵
-#         total_reward = 0.0
-
-#         # 1. 前進獎勵 (v): 根據 x_pos 的變化
-#         v = max(0, x_pos - self._max_x_pos) * 2  # 縮放係數 0.1
-#         total_reward += v
-
-#         # 2. 時間懲罰 (c): 根據 time 的變化
-#         c = (self._current_time - time) * -1  # 每減少 1 單位時間，懲罰 -0.5
-#         total_reward += c
-
-#         # 3. 死亡懲罰 (d): 根據 life 的減少
-#         d = 0
-#         if life < self._current_life:  # 生命減少表示死亡
-#             d = -50  # 死亡懲罰
-#         total_reward += d
-
-#         # 4. 分數增量 (s): 根據 score 的增量
-#         s = (score - self._current_score) * 0.5  # 縮放係數 0.1
-#         total_reward += s
-
-#         # 5. 硬幣獎勵 (coin): 根據 coins 的增量
-#         coin = (coins - self._current_coins) * 20  # 每收集 1 個硬幣獎勵 10
-#         total_reward += coin
-
-#         # 6. 終點獎勵 (flag): 如果到達終點旗幟
-#         if flag_get:
-#             total_reward += 150  # 到達終點獎勵
-
-#         # 7. 狀態獎勵 (status): 根據 Mario 狀態的變化
-#         status_reward = 0
-#         status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
-#         current_status_value = status_map.get(self._current_status, 0)
-#         new_status_value = status_map.get(status, 0)
-#         if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
-#             status_reward = 50  # 狀態提升獎勵
-#         elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
-#             status_reward = -20  # 狀態下降懲罰
-#         total_reward += status_reward
-
-#         # 裁剪獎勵到 [-50, 50] 範圍，避免過大或過小的值
-#         total_reward = np.clip(total_reward / 10, -15, 15)
-
-#         # total_reward += reward
-
-#         # 更新當前狀態
-#         self._max_x_pos = max(self._max_x_pos, x_pos)
-#         self._current_time = time
-#         self._current_life = life
-#         self._current_score = score
-#         self._current_coins = coins
-#         self._current_status = status
-
-#         return state, total_reward, done, info
+        if not self.reward_shaping:
+            return state, reward, done, info
+        return state, reward + shaped_reward, done, info
 
 def make_env(env):
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = CustomReward(env)
+    env = CustomReward(env, reward_shaping=False)
     env = SkipAndMax(env, skip=4)
     env = Frame_Processing(env)
     env = BufferingWrapper(env, n_steps=4)
@@ -635,7 +560,7 @@ class RainbowDQNAgent:
 
         self.episode = 0
         self.avg_window_size = avg_window_size
-        self.best_avg_reward = -np.inf
+        # self.best_avg_reward = -np.inf
 
     def select_action(self, state: np.ndarray) -> int:
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -722,7 +647,7 @@ class RainbowDQNAgent:
             'update_count': self.update_count,
             'beta': self.beta,
             'episode': self.episode,
-            'best_avg_reward': self.best_avg_reward,
+            # 'best_avg_reward': self.best_avg_reward,
             'memory_state': self.memory.get_state(),
         }
         with open(metadata_path, 'wb') as f:
@@ -754,7 +679,7 @@ class RainbowDQNAgent:
         self.update_count = metadata['update_count']
         self.beta = metadata['beta']
         self.episode = metadata['episode']
-        self.best_avg_reward = metadata['best_avg_reward']
+        # self.best_avg_reward = metadata['best_avg_reward']
         self.memory.set_state(metadata['memory_state'])
 
         print(f"Model loaded from {path}, metadata loaded from {metadata_path}")
@@ -767,9 +692,13 @@ class RainbowDQNAgent:
             self.episode += 1
 
             episode_reward = 0
+            episode_reward_origin = 0
+
             state = self.env.reset()
             state = np.asarray(state)
             done = False
+
+            cur_life = 2
 
             while not done:
                 self.total_steps += 1
@@ -780,6 +709,29 @@ class RainbowDQNAgent:
 
                 self.memory.store(state, action, reward, next_state, done)
                 episode_reward += reward
+                episode_reward_origin += info['reward']
+
+                # Episode End
+                new_life = info['life']
+                if new_life == 255:
+                    new_life = -1
+                if new_life < cur_life or done or info.get('end', False):
+
+                    self.rewards.append(episode_reward_origin)
+                    print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f} | Origin Reward {episode_reward_origin:.1f}")
+
+                    if self.episode % save_interval == 0:
+                        self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
+
+                    if self.episode % plot_interval == 0:
+                        self.plot(self.episode)
+
+                    if not done:
+                        cur_life = new_life
+                        episode_reward = 0
+                        episode_reward_origin = 0
+                        self.episode += 1
+
                 state = next_state
 
                 if len(self.memory) >= self.batch_size:
@@ -795,22 +747,13 @@ class RainbowDQNAgent:
 
                 frame_idx += 1
 
-            self.rewards.append(episode_reward)
-            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f}")
-
             # if self.episode >= self.avg_window_size:
             #     avg_reward = np.mean(self.rewards[-self.avg_window_size:])
             #     if avg_reward > self.best_avg_reward:
             #         self.best_avg_reward = avg_reward
             #         self.save_model(f"{self.model_save_dir}/Best{self.best_avg_reward:.0f}_Episode{self.episode}.pth")
 
-            if self.episode % save_interval == 0:
-                self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
-
-            if self.episode % plot_interval == 0:
-                self.plot(self.episode)
-
-        print(f"Best avg reward: {self.best_avg_reward}")
+        # print(f"Best avg reward: {self.best_avg_reward}")
 
     def plot(self, episode: int):
         # clear_output(True)
@@ -821,10 +764,10 @@ class RainbowDQNAgent:
         else:
             avg_reward = np.mean(self.rewards)
         plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
-        plt.plot(self.rewards)
+        plt.plot(self.rewards[580:])
         plt.subplot(122)
         plt.title("Loss")
-        plt.plot(self.losses)
+        plt.plot(self.losses[380000:])
         # plt.show()
 
         save_path = os.path.join(self.plot_dir, f"episode_{episode}.png")
@@ -844,22 +787,22 @@ if __name__ == "__main__":
         memory_size=10000,
         batch_size=128,
         target_update=5000,
-        seed=777,
+        seed=-1,
         gamma=0.99,
         alpha=0.6,
         beta=0.4,
         prior_eps=1e-6,
-        v_min=-1000.0,
+        v_min=-1500.0,
         v_max=7000.0,
         atom_size=51,
         n_step=5,
-        tau=0.85,
-        lr=0.00001,
+        tau=0.5,
+        lr=0.000001,
         avg_window_size=100,
         model_save_dir="./models",
         plot_dir="./plots"
     )
 
-    # agent.load_model("./models/Episode640.pth")
-    agent.train(num_episodes=1000, save_interval=10, plot_interval=10)
+    agent.load_model("./models/Episode580.pth", eval_mode=False)
+    agent.train(num_episodes=1000, save_interval=50, plot_interval=50)
     env.close()
