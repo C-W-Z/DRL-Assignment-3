@@ -23,7 +23,7 @@ class Agent(object):
         self.device = self.agent.device
 
         # 載入預訓練模型並優化
-        self.agent.load_model("Episode480.pth", eval_mode=True)
+        self.agent.load_model("./models/Episode610.pth", eval_mode=True)
         self.agent.dqn = torch.jit.script(self.agent.dqn)  # 加速推理
 
         # Skipframe 參數
@@ -52,6 +52,8 @@ class Agent(object):
         # 如果是第一次調用
         if self.frame_count == 0:
             return 0 # NOOP action
+            # self.obs_buffer.append(observation)
+            # self.frame_count += 1
 
         # 模擬 SkipAndMax 的最大化操作
         max_frame = np.max(np.stack(self.obs_buffer), axis=0)  # 形狀：(240, 256, 3)

@@ -101,31 +101,68 @@ class CustomReward(gym.Wrapper):
         super(CustomReward, self).__init__(env)
         self._current_score = 0
         self._current_life = 2
+        self._current_time = 400
+        self._max_x_pos = 40
+        self._current_coins = 0
+        self._current_status = 'small'
 
     def reset(self):
         self._current_score = 0
         self._current_life = 2
+        self._current_time = 400
+        self._max_x_pos = 40
+        self._current_coins = 0
+        self._current_status = 'small'
         return self.env.reset()
 
     def step(self, action):
         state, reward, done, info = self.env.step(action)
 
-        # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
+        # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 400, 'world': 1, 'x_pos': 40, 'y_pos': 79}
 
         score = info["score"]
         life = info["life"]
+        x_pos = info["x_pos"]
+        coins = info['coins']
+        status = info['status']
 
         if reward <= 0:
             reward -= 0.1
         # reward *= 10
 
-        reward += (score - self._current_score) / 50
+        # 前進獎勵: 根據 x_pos 的增量
+        if x_pos > self._max_x_pos:
+            self._max_x_pos = x_pos
+            reward += (x_pos - self._max_x_pos) / 10
 
-        if life < self._current_life:
+        reward += (score - self._current_score) / 10
+
+        # 硬幣獎勵 (coin): 根據 coins 的增量
+        coin = (coins - self._current_coins) * 10  # 每收集 1 個硬幣獎勵 10
+        reward += coin
+
+        # 狀態獎勵 (status): 根據 Mario 狀態的變化
+        status_reward = 0
+        status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
+        current_status_value = status_map.get(self._current_status, 0)
+        new_status_value = status_map.get(status, 0)
+        if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
+            status_reward = 25  # 狀態提升獎勵
+        elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
+            status_reward = -10  # 狀態下降懲罰
+        reward += status_reward
+
+        if life < self._current_life or life == 255 or self._current_time == 0:
+            print("Died", self._current_time, self._max_x_pos)
             reward -= 50
+            self._max_x_pos = 0
+            # print(info)
 
         self._current_score = score
         self._current_life = life
+        self._current_time = info['time']
+        self._current_coins = coins
+        self._current_status = status
 
         if info["flag_get"]:
             reward += 500
@@ -224,10 +261,10 @@ class CustomReward(gym.Wrapper):
 
 def make_env(env):
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    env = CustomReward(env)
     env = SkipAndMax(env, skip=4)
     env = Frame_Processing(env)
     env = BufferingWrapper(env, n_steps=4)
-    env = CustomReward(env)
     return env
 
 # 2. Replay Buffer（基礎 N-step Buffer，使用 numba 加速）
@@ -607,10 +644,6 @@ class RainbowDQNAgent:
             action = q_value.argmax().item()
         return action
 
-    def step(self, action: int) -> Tuple[np.ndarray, np.float64, bool]:
-        next_state, reward, done, info = self.env.step(action)
-        return next_state, reward, done
-
     def compute_dqn_loss(self, samples: Dict[str, np.ndarray]) -> torch.Tensor:
         state = torch.FloatTensor(samples["obs"]).to(self.device)
         next_state = torch.FloatTensor(samples["next_obs"]).to(self.device)
@@ -741,8 +774,9 @@ class RainbowDQNAgent:
             while not done:
                 self.total_steps += 1
                 action = self.select_action(state)
-                next_state, reward, done = self.step(action)
+                next_state, reward, done, info = self.env.step(action)
                 next_state = np.asarray(next_state)
+                # self.env.render()
 
                 self.memory.store(state, action, reward, next_state, done)
                 episode_reward += reward
@@ -810,7 +844,7 @@ if __name__ == "__main__":
         memory_size=10000,
         batch_size=128,
         target_update=5000,
-        seed=1226,
+        seed=777,
         gamma=0.99,
         alpha=0.6,
         beta=0.4,
@@ -820,12 +854,12 @@ if __name__ == "__main__":
         atom_size=51,
         n_step=5,
         tau=0.85,
-        lr=0.00005,
+        lr=0.00001,
         avg_window_size=100,
         model_save_dir="./models",
         plot_dir="./plots"
     )
 
-    agent.load_model("./models/Episode450.pth")
+    # agent.load_model("./models/Episode640.pth")
     agent.train(num_episodes=1000, save_interval=10, plot_interval=10)
     env.close()
