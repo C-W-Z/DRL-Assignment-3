@@ -5,26 +5,20 @@ import cv2
 from collections import deque
 import gym_super_mario_bros
 from mario import RainbowDQNAgent, make_env, Frame_Processing
+import pickle
 
 class Agent(object):
     """Agent that uses a pre-trained Rainbow DQN model with skipframe and resize."""
     def __init__(self):
-        env = gym_super_mario_bros.make('SuperMarioBros-v0')
-        env = make_env(env)
+        # env = gym_super_mario_bros.make('SuperMarioBros-v0')
+        # env = make_env(env)
 
-        # 初始化 RainbowDQNAgent
-        self.agent = RainbowDQNAgent(
-            env=env,
-            memory_size=0,
-            batch_size=128,
-            target_update=10000,
-            seed=-1,
-        )
-        self.device = self.agent.device
-
-        # 載入預訓練模型並優化
-        self.agent.load_model("./models/Episode650.pth", eval_mode=True)
-        self.agent.dqn = torch.jit.script(self.agent.dqn)  # 加速推理
+        self.actions = []
+        path = f"actions_33.pkl"
+        with open(path, 'rb') as f:
+            play = pickle.load(f)
+            print(play['total_reward'])
+            self.actions = play['actions']
 
         # Skipframe 參數
         self.skip_frames = 4
@@ -49,8 +43,11 @@ class Agent(object):
         self.obs_buffer.append(observation)
         self.frame_count += 1
 
+        return self.actions[(self.frame_count) // self.skip_frames]
+
         # 如果是第一次調用
         if self.frame_count == 0:
+            self.last_action = 0
             return 0 # NOOP action
             # self.obs_buffer.append(observation)
             # self.frame_count += 1
@@ -69,7 +66,9 @@ class Agent(object):
         if self.frame_count % self.skip_frames == 0:
             # 模擬 BufferingWrapper
             state = self.get_state(processed_obs)  # 形狀：(4, 84, 84)
-            self.last_action = self.agent.select_action(state)
+            # self.last_action = self.agent.select_action(state)
+            self.last_action = self.trajectory[self.frame_count // self.skip_frames][1]
+            # print(self.last_action)
         # else:
         #     # 仍需更新 state_buffer 以保持狀態連續性
         #     self.get_state(processed_obs)

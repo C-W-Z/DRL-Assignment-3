@@ -211,7 +211,7 @@ play = {
     'total_reward': total_reward,
 }
 
-path = "./human_play/play_29.pkl"
+path = "./human_play/play_34.pkl"
 with open(path, 'wb') as f:
     pickle.dump(play, f)
 print(f"trajectory saved to {path}")
