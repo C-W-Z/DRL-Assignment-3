@@ -131,7 +131,7 @@ class InputHandler:
         pressed_keys = sorted(pressed_keys)
         for i, action in enumerate(COMPLEX_MOVEMENT):
             if pressed_keys == sorted(action):
-                print(f"Action: {action}, Index: {i}")
+                # print(f"Action: {action}, Index: {i}")
                 return i
 
         return 0  # 無匹配動作時返回NOOP
@@ -191,6 +191,8 @@ while not done:
     next_state, reward, done, info = env.step(action)
     trajectory.append((state, action, reward, next_state, done))
     total_reward += reward
+    if reward != 0:
+        print(reward)
 
     # 使用info中的raw_states進行渲染（選擇最後一幀）
     raw_state = info.get('raw_states', [state])[-1]  # 取最後一幀原始state
@@ -199,7 +201,7 @@ while not done:
     pygame.display.flip()
 
     state = next_state
-    clock.tick(20)
+    clock.tick(2)
 
 env.close()
 pygame.quit()
@@ -211,7 +213,7 @@ play = {
     'total_reward': total_reward,
 }
 
-path = "./human_play/play_34.pkl"
+path = "./human_play/play_44.pkl"
 with open(path, 'wb') as f:
     pickle.dump(play, f)
 print(f"trajectory saved to {path}")

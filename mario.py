@@ -4,7 +4,7 @@ import random
 import pickle
 from collections import deque
 from typing import Dict, List, Tuple
-
+from tqdm import tqdm
 import gym
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
@@ -82,13 +82,13 @@ class SkipAndMax(gym.Wrapper):
         origin_reward = 0
         for _ in range(self._skip):
             obs, reward, done, info = self.env.step(action)
-            origin_reward += info.get('reward', 0)
+            # origin_reward += info.get('reward', 0)
             self.obs_buffer.append(obs)
             total_reward += reward
             if done:
                 break
         max_frame = np.max(np.stack(self.obs_buffer), axis=0)
-        info['reward'] = origin_reward
+        # info['reward'] = origin_reward
         return max_frame, total_reward, done, info
 
     def reset(self):
@@ -462,8 +462,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self.min_tree.tree = state['min_tree_tree']
         self.tree_ptr = state['tree_ptr']
         self.max_priority = state['max_priority']
-        self.episode_success = state['episode_success']
-        self.state_to_episode = state['state_to_episode']
+        # self.episode_success = state['episode_success']
+        # self.state_to_episode = state['state_to_episode']
 
 # 4. Noisy Linear Layer
 class NoisyLinear(nn.Module):
@@ -755,13 +755,13 @@ class RainbowDQNAgent:
             self.episode += 1
 
             episode_reward = 0
-            episode_reward_origin = 0
+            # episode_reward_origin = 0
 
             state = self.env.reset()
             state = np.asarray(state)
             done = False
 
-            cur_life = 2
+            # cur_life = 2
 
             while not done:
                 self.total_steps += 1
@@ -772,7 +772,7 @@ class RainbowDQNAgent:
 
                 self.memory.store(state, action, reward, next_state, done, self.episode)
                 episode_reward += reward
-                episode_reward_origin += info['reward']
+                # episode_reward_origin += info['reward']
 
                 # Episode End
                 # new_life = info['life']
@@ -820,16 +820,18 @@ class RainbowDQNAgent:
                 frame_idx += 1
 
             # 當前生命週期結束，計算成功度並更新
-            success_score = episode_reward / 1000.0  # 標準化成功度
+            # success_score = episode_reward / 3000.0  # 標準化成功度
             # if info['x_pos'] >= 1320 and episode_reward < 1000 and new_life != 1:
             #     success_score += self.rewards[-1] / 1000.0
-            if info['flag_get']:
-                success_score += 5.0  # 通關給予額外權重
-            success_score = max(success_score, self.prior_eps)
-            self.memory.update_episode_success(self.episode, success_score)
+            # if info['flag_get']:
+            #     success_score += 5.0  # 通關給予額外權重
+            # if episode_reward > 4000:
+            #     success_score += 1.0
+            # success_score = max(success_score, self.prior_eps)
+            # self.memory.update_episode_success(self.episode, success_score)
 
-            self.rewards.append(episode_reward_origin)
-            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f} | Origin Reward {episode_reward_origin:.0f}")
+            self.rewards.append(episode_reward)
+            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.0f} | Stage {info['stage']}")
 
             if self.episode % save_interval == 0:
                 self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
@@ -874,7 +876,7 @@ if __name__ == "__main__":
 
     agent = RainbowDQNAgent(
         env=env,
-        memory_size=10000,
+        memory_size=50000,
         batch_size=128,
         target_update=5000,
         seed=-1,
@@ -882,18 +884,74 @@ if __name__ == "__main__":
         alpha=0.6,
         beta=0.4,
         prior_eps=1e-6,
-        v_min=-1500.0,
+        v_min=-1000.0,
         v_max=7000.0,
         atom_size=51,
         n_step=5,
         tau=0.5,
-        lr=0.000001,
+        lr=0.000005,
         avg_window_size=100,
         model_save_dir="./models",
         plot_dir="./plots"
     )
 
-    # agent.load_model("./models/Episode1100.pth", eval_mode=False)
+    agent.load_model("./models/Episode580.pth", eval_mode=False)
     # agent.beta = 0.5
-    agent.train(num_episodes=3000, save_interval=50, plot_interval=50)
+
+    agent.dqn.train()
+    frame_idx = len(agent.losses) + 1
+
+    # ids = [1, 8, 9, 11, 13, 14, 19, 22, 24, 28, 30, 31, 32, 33, 34]
+    ids = [40, 41, 42, 43, 44]
+
+    for id in ids:
+        agent.episode += 1
+
+        path = f"./human_play/play_{id}.pkl"
+        with open(path, 'rb') as f:
+            play = pickle.load(f)
+        episode_reward = play['total_reward']
+        trajectory = play['trajectory']
+
+        for state, action, reward, next_state, done in trajectory:
+            agent.memory.store(state, action, reward, next_state, done, agent.episode)
+
+            if len(agent.memory) >= agent.batch_size:
+                loss = agent.update_model()
+                agent.losses.append(loss)
+                agent.update_count += 1
+
+                if agent.update_count % agent.target_update == 0:
+                    if agent.tau == 1:
+                        agent.target_hard_update()
+                    else:
+                        agent.target_soft_update()
+
+            frame_idx += 1
+
+        # 當前生命週期結束，計算成功度並更新
+        # success_score = episode_reward / 3000.0  # 標準化成功度
+        # success_score = max(success_score, agent.prior_eps)
+        # agent.memory.update_episode_success(agent.episode, success_score)
+
+        agent.rewards.append(episode_reward)
+        print(f"Episode {agent.episode} | Frame {frame_idx} | Reward {episode_reward:.0f}")
+
+    # for _ in tqdm(range(2000)):
+    #     if len(agent.memory) >= agent.batch_size:
+    #         loss = agent.update_model()
+    #         agent.losses.append(loss)
+    #         agent.update_count += 1
+
+    #         if agent.update_count % agent.target_update == 0:
+    #             if agent.tau == 1:
+    #                 agent.target_hard_update()
+    #             else:
+    #                 agent.target_soft_update()
+    #     frame_idx += 1
+
+    agent.save_model(f"{agent.model_save_dir}/Episode{agent.episode}.pth")
+    agent.plot(agent.episode)
+
+    agent.train(num_episodes=3000, save_interval=10, plot_interval=10)
     env.close()
