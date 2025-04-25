@@ -31,6 +31,44 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+class EpisodicLifeEnv(gym.Wrapper):
+
+    def __init__(self, env):
+        """Make end-of-life == end-of-episode, but only reset on true game
+        over. Done by DeepMind for the DQN and co. since it helps value
+        estimation.
+        """
+        gym.Wrapper.__init__(self, env)
+        self.lives = 0
+        self.was_real_done = True
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        self.was_real_done = done
+        # check current lives, make loss of life terminal,
+        # then update lives to handle bonus lives
+        lives = self.env.unwrapped._life
+        if self.lives > lives > 0:
+            # for Qbert sometimes we stay in lives == 0 condtion for a few fr
+            # so its important to keep lives > 0, so that we only reset once
+            # the environment advertises done.
+            done = True
+        self.lives = lives
+        return obs, reward, done, info
+
+    def reset(self, **kwargs):
+        """Reset only when lives are exhausted.
+        This way all states are still reachable even though lives are episodic,
+        and the learner need not know about any of this behind-the-scenes.
+        """
+        if self.was_real_done:
+            obs = self.env.reset(**kwargs)
+        else:
+            # no-op step to advance from terminal/lost life state
+            obs, _, _, _ = self.env.step(0)
+        self.lives = self.env.unwrapped._life
+        return obs
+
 # 環境預處理 Wrapper
 class SkipAndMax(gym.Wrapper):
     def __init__(self, env=None, skip=4):
@@ -137,39 +175,40 @@ class CustomReward(gym.Wrapper):
         shaped_reward = 0
 
         # 前進獎勵: 根據 x_pos 的增量
-        if x_pos > self._max_x_pos:
-            self._max_x_pos = x_pos
-            shaped_reward += (x_pos - self._max_x_pos) / 5
+        # if x_pos > self._max_x_pos:
+        #     self._max_x_pos = x_pos
+            # shaped_reward += (x_pos - self._max_x_pos) / 5
         # 時間流逝
-        elif reward <= 0 and time < self._current_time:
+        # elif reward <= 0 and time < self._current_time:
+        if reward <= 0 and time < self._current_time:
             shaped_reward -= 0.1
 
         shaped_reward += (score - self._current_score) / 10
 
-        # 硬幣獎勵 (coin): 根據 coins 的增量
-        coin = (coins - self._current_coins) * 10  # 每收集 1 個硬幣獎勵 10
-        shaped_reward += coin
+        # # 硬幣獎勵 (coin): 根據 coins 的增量
+        # coin = (coins - self._current_coins) * 10  # 每收集 1 個硬幣獎勵 10
+        # shaped_reward += coin
 
-        # 狀態獎勵 (status): 根據 Mario 狀態的變化
-        status_reward = 0
-        status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
-        current_status_value = status_map.get(self._current_status, 0)
-        new_status_value = status_map.get(status, 0)
-        if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
-            status_reward = 25  # 狀態提升獎勵
-        elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
-            status_reward = -10  # 狀態下降懲罰
-        shaped_reward += status_reward
+        # # 狀態獎勵 (status): 根據 Mario 狀態的變化
+        # status_reward = 0
+        # status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
+        # current_status_value = status_map.get(self._current_status, 0)
+        # new_status_value = status_map.get(status, 0)
+        # if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
+        #     status_reward = 25  # 狀態提升獎勵
+        # elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
+        #     status_reward = -10  # 狀態下降懲罰
+        # shaped_reward += status_reward
 
-        if life == 255:
-            life = -1
-        if life < self._current_life or done or (time == 0 and self._current_time > 0):
-            if self._current_time != 0:
-                print("Died", life, self._current_time, self._max_x_pos)
-                shaped_reward -= 50
-            self._max_x_pos = x_pos
-            info['end'] = True
-            # print(info)
+        # if life == 255:
+        #     life = -1
+        # if life < self._current_life or done or (time == 0 and self._current_time > 0):
+        #     if self._current_time != 0:
+        #         print("Died", life, self._current_time, self._max_x_pos)
+        #         shaped_reward -= 50
+        #     self._max_x_pos = x_pos
+        #     info['end'] = True
+        #     # print(info)
 
         self._current_score = score
         self._current_life = life
@@ -186,7 +225,8 @@ class CustomReward(gym.Wrapper):
 
 def make_env(env):
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = CustomReward(env, reward_shaping=False)
+    # env = EpisodicLifeEnv(env)
+    # env = CustomReward(env, reward_shaping=False)
     env = SkipAndMax(env, skip=4)
     env = Frame_Processing(env)
     env = BufferingWrapper(env, n_steps=4)
@@ -301,6 +341,10 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self.max_priority, self.tree_ptr = 1.0, 0
         self.alpha = alpha
 
+        # 增加 episode 成功度的追蹤
+        self.episode_success = np.zeros(size, dtype=np.float32)  # 儲存每個 state 的 episode 成功度
+        self.state_to_episode = np.zeros(size, dtype=np.int32)  # 每個 state 對應的 episode ID
+
         tree_capacity = 1
         while tree_capacity < self.max_size:
             tree_capacity *= 2
@@ -315,13 +359,24 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         rew: float,
         next_obs: np.ndarray,
         done: bool,
+        episode_id: int,
     ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
         transition = super().store(obs, act, rew, next_obs, done)
         if transition:
+            # 記錄 state 對應的 episode ID
+            self.state_to_episode[self.tree_ptr] = episode_id
+
             self.sum_tree[self.tree_ptr] = self.max_priority ** self.alpha
             self.min_tree[self.tree_ptr] = self.max_priority ** self.alpha
             self.tree_ptr = (self.tree_ptr + 1) % self.max_size
         return transition
+
+    def update_episode_success(self, episode_id: int, success_score: float):
+        """更新 episode 的成功度"""
+        # 將成功度分配給該 episode 的所有 state
+        for idx in range(self.max_size):
+            if self.state_to_episode[idx] == episode_id:
+                self.episode_success[idx] = success_score
 
     def sample_batch(self, beta: float = 0.4) -> Dict[str, np.ndarray]:
         assert len(self) >= self.batch_size, f"Buffer size {len(self)} is less than batch size {self.batch_size}"
@@ -361,7 +416,11 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
         for idx, priority in zip(indices, priorities):
             assert 0 <= idx < len(self), f"Index {idx} out of bounds [0, {len(self)})"
-            priority_alpha = priority ** self.alpha
+            # 結合 episode 成功度調整優先級
+            success_weight = self.episode_success[idx] if self.episode_success[idx] > 0 else 1.0
+            adjusted_priority = priority * success_weight  # 乘以成功度權重
+            priority_alpha = adjusted_priority ** self.alpha
+            # priority_alpha = priority ** self.alpha
             self.sum_tree[idx] = priority_alpha
             self.min_tree[idx] = priority_alpha
             self.max_priority = max(self.max_priority, priority)
@@ -383,6 +442,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             'min_tree_tree': self.min_tree.tree,
             'tree_ptr': self.tree_ptr,
             'max_priority': self.max_priority,
+            'episode_success': self.episode_success,
+            'state_to_episode': self.state_to_episode,
         }
 
     def set_state(self, state: Dict[str, np.ndarray]):
@@ -401,6 +462,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         self.min_tree.tree = state['min_tree_tree']
         self.tree_ptr = state['tree_ptr']
         self.max_priority = state['max_priority']
+        self.episode_success = state['episode_success']
+        self.state_to_episode = state['state_to_episode']
 
 # 4. Noisy Linear Layer
 class NoisyLinear(nn.Module):
@@ -707,30 +770,39 @@ class RainbowDQNAgent:
                 next_state = np.asarray(next_state)
                 # self.env.render()
 
-                self.memory.store(state, action, reward, next_state, done)
+                self.memory.store(state, action, reward, next_state, done, self.episode)
                 episode_reward += reward
                 episode_reward_origin += info['reward']
 
                 # Episode End
-                new_life = info['life']
-                if new_life == 255:
-                    new_life = -1
-                if new_life < cur_life or done or info.get('end', False):
+                # new_life = info['life']
+                # if new_life == 255:
+                #     new_life = -1
+                # if new_life < cur_life or done or info.get('end', False):
 
-                    self.rewards.append(episode_reward_origin)
-                    print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f} | Origin Reward {episode_reward_origin:.1f}")
+                #     # 當前生命週期結束，計算成功度並更新
+                #     success_score = episode_reward / 1000.0  # 標準化成功度
+                #     # if info['x_pos'] >= 1320 and episode_reward < 1000 and new_life != 1:
+                #     #     success_score += self.rewards[-1] / 1000.0
+                #     if info['flag_get']:
+                #         success_score += 5.0  # 通關給予額外權重
+                #     success_score = max(success_score, self.prior_eps)
+                #     self.memory.update_episode_success(self.episode, success_score)
 
-                    if self.episode % save_interval == 0:
-                        self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
+                #     self.rewards.append(episode_reward_origin)
+                #     print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f} | Origin Reward {episode_reward_origin:.1f}")
 
-                    if self.episode % plot_interval == 0:
-                        self.plot(self.episode)
+                #     if self.episode % save_interval == 0:
+                #         self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
 
-                    if not done:
-                        cur_life = new_life
-                        episode_reward = 0
-                        episode_reward_origin = 0
-                        self.episode += 1
+                #     if self.episode % plot_interval == 0:
+                #         self.plot(self.episode)
+
+                #     if not done:
+                #         cur_life = new_life
+                #         episode_reward = 0
+                #         episode_reward_origin = 0
+                #         self.episode += 1
 
                 state = next_state
 
@@ -746,6 +818,24 @@ class RainbowDQNAgent:
                             self.target_soft_update()
 
                 frame_idx += 1
+
+            # 當前生命週期結束，計算成功度並更新
+            success_score = episode_reward / 1000.0  # 標準化成功度
+            # if info['x_pos'] >= 1320 and episode_reward < 1000 and new_life != 1:
+            #     success_score += self.rewards[-1] / 1000.0
+            if info['flag_get']:
+                success_score += 5.0  # 通關給予額外權重
+            success_score = max(success_score, self.prior_eps)
+            self.memory.update_episode_success(self.episode, success_score)
+
+            self.rewards.append(episode_reward_origin)
+            print(f"Episode {self.episode} | Frame {frame_idx} | Reward {episode_reward:.1f} | Origin Reward {episode_reward_origin:.0f}")
+
+            if self.episode % save_interval == 0:
+                self.save_model(f"{self.model_save_dir}/Episode{self.episode}.pth")
+
+            if self.episode % plot_interval == 0:
+                self.plot(self.episode)
 
             # if self.episode >= self.avg_window_size:
             #     avg_reward = np.mean(self.rewards[-self.avg_window_size:])
@@ -764,10 +854,10 @@ class RainbowDQNAgent:
         else:
             avg_reward = np.mean(self.rewards)
         plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
-        plt.plot(self.rewards[580:])
+        plt.plot(self.rewards)
         plt.subplot(122)
         plt.title("Loss")
-        plt.plot(self.losses[380000:])
+        plt.plot(self.losses)
         # plt.show()
 
         save_path = os.path.join(self.plot_dir, f"episode_{episode}.png")
@@ -803,6 +893,7 @@ if __name__ == "__main__":
         plot_dir="./plots"
     )
 
-    agent.load_model("./models/Episode580.pth", eval_mode=False)
-    agent.train(num_episodes=1000, save_interval=50, plot_interval=50)
+    # agent.load_model("./models/Episode1100.pth", eval_mode=False)
+    # agent.beta = 0.5
+    agent.train(num_episodes=3000, save_interval=50, plot_interval=50)
     env.close()
