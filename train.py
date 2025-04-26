@@ -33,7 +33,7 @@ BATCH_SIZE              = 64
 GAMMA                   = 0.99
 TARGET_UPDATE           = 10000
 NOISY_STD_INIT          = 2.5
-LR                      = 0.0001
+LR                      = 0.00025
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -66,20 +66,29 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 # -----------------------------
 # 1. Environment Wrappers
 # -----------------------------
-class SkipFrame(gym.Wrapper):
+class SkipAndMax(gym.Wrapper):
     def __init__(self, env, skip):
         super().__init__(env)
-        self.skip = skip
+        self._skip = skip
+        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
 
     def step(self, action):
-        total_reward = 0.0
+        total_reward = 0
         done = False
-        for _ in range(self.skip):
+        for i in range(self._skip):
             obs, reward, done, info = self.env.step(action)
+            self._obs_buffer[i & 1] = np.asarray(obs)
             total_reward += reward
             if done:
                 break
-        return obs, total_reward, done, info
+        max_frame = np.max(self._obs_buffer, axis=0)
+        return max_frame, total_reward, done, info
+
+    def reset(self):
+        obs = self.env.reset()
+        obs = np.asarray(obs)
+        self._obs_buffer[0] = self._obs_buffer[1] = obs
+        return obs
 
 class GrayScaleResizeCrop(gym.ObservationWrapper):
     def __init__(self, env):
@@ -100,7 +109,8 @@ class GrayScaleResizeCrop(gym.ObservationWrapper):
         frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
         frame = frame[18:102, :]  # (84, 84)
         # 轉為 (1, 84, 84)，規範化到 [0, 1]
-        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
+        return frame.astype(np.float32)[np.newaxis, :, :]
+        # assert frame.shape == (1, 84, 84)
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, n_steps=4):
@@ -127,7 +137,7 @@ class FrameStack(gym.Wrapper):
 def make_env():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = SkipFrame(env, skip=SKIP_FRAMES)
+    env = SkipAndMax(env, skip=SKIP_FRAMES)
     env = GrayScaleResizeCrop(env)
     env = FrameStack(env, n_steps=STACK_FRAMES)
     env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
@@ -137,19 +147,17 @@ def make_env():
 # 2. Noisy Linear Layer
 # -----------------------------
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, std_init: float=NOISY_STD_INIT):
+    def __init__(self, in_features, out_features, std_init=NOISY_STD_INIT):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
-        # 參數
         self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.register_buffer("weight_epsilon", torch.Tensor(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.Tensor(out_features))
         self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
-        # 提前計算的噪音
-        self.register_buffer("weight_noise", torch.Tensor(out_features, in_features))
-        self.register_buffer("bias_noise", torch.Tensor(out_features))
+        self.register_buffer("bias_epsilon", torch.Tensor(out_features))
         self.reset_parameters()
         self.reset_noise()
 
@@ -163,26 +171,20 @@ class NoisyLinear(nn.Module):
     def reset_noise(self):
         epsilon_in = self.scale_noise(self.in_features)
         epsilon_out = self.scale_noise(self.out_features)
-        # 使用 torch.outer 替代 ger
-        weight_epsilon = torch.outer(epsilon_out, epsilon_in)
-        # 提前計算 weight_sigma * weight_epsilon
-        self.weight_noise.copy_(self.weight_sigma * weight_epsilon)
-        self.bias_noise.copy_(self.bias_sigma * epsilon_out)
+        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
 
     def forward(self, x):
         if self.training:
-            # 只需加法，減少逐元素乘法
-            weight = self.weight_mu + self.weight_noise
-            bias = self.bias_mu + self.bias_noise
+            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
         else:
             weight = self.weight_mu
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
     def scale_noise(self, size) -> torch.Tensor:
-        # 確保在 GPU 上生成隨機數
-        x = torch.randn(size, device=self.weight_mu.device)
-        # 優化計算
+        x = torch.randn(size)
         return x.sign().mul(x.abs().sqrt())
 
 # -----------------------------
@@ -239,7 +241,7 @@ class DuelingDistNetwork(nn.Module):
         self.feat_dim = feat_dim
 
     def forward(self, x):
-        x = self.features(x)
+        x = self.get_features(x)
         value = F.relu(self.value_noisy(x))
         value = self.value(value).view(-1, 1, self.atom_size)
         adv = F.relu(self.adv_noisy(x))
@@ -250,7 +252,7 @@ class DuelingDistNetwork(nn.Module):
         return q
 
     def dist(self, x):
-        x = self.features(x)
+        x = self.get_features(x)
         value = F.relu(self.value_noisy(x))
         value = self.value(value).view(-1, 1, self.atom_size)
         adv = F.relu(self.adv_noisy(x))
@@ -258,6 +260,9 @@ class DuelingDistNetwork(nn.Module):
         q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
         dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
         return dist
+
+    def get_features(self, x):
+        return self.features(x / 255.0)
 
     def reset_noise(self):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
@@ -472,8 +477,8 @@ class Agent:
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
         # ICM loss
-        feat = self.online.features(state)
-        next_feat = self.online.features(next_state)
+        feat = self.online.get_features(state)
+        next_feat = self.online.get_features(next_state)
         logits, pred_phi_n, true_phi_n = self.icm(feat.detach(), next_feat.detach(), action)
         inv_loss = F.cross_entropy(logits, action)
         fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
@@ -565,13 +570,13 @@ def plot_figure(agent: Agent, episode: int):
     plt.close()
     tqdm.write(f"Plot saved to {save_path}")
 
-def evaluation(env, agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
-    state = env.reset()
+def evaluation(eval_env, agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+    state = eval_env.reset()
     e_reward = 0
     done = False
     while not done:
         e_action = agent.act(state)
-        state, reward, done, _ = env.step(e_action)
+        state, reward, done, _ = eval_env.step(e_action)
         e_reward += reward
     agent.eval_rewards.append(e_reward)
     if e_reward > agent.best_eval_reward:
@@ -584,6 +589,7 @@ def evaluation(env, agent: Agent, episode: int, best_checkpoint_path='models/bes
 
 def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env()
+    eval_env = make_env()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     agent = Agent(env.observation_space.shape, env.action_space.n, device)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -653,7 +659,7 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
-            evaluation(env, agent, ep, best_checkpoint_path)
+            evaluation(eval_env, agent, ep, best_checkpoint_path)
 
         # Plot
         if ep % PLOT_INTERVAL == 0:
@@ -669,6 +675,7 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
     progress_bar.close()
     env.close()
+    eval_env.close()
 
 if __name__ == '__main__':
     train(num_episodes=100000)
