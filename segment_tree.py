@@ -6,10 +6,10 @@
 """
 
 import numpy as np
-import numba
+from numba import njit
 from typing import Callable
 
-@numba.jit(nopython=True)
+@njit
 def _operate_helper_sum(tree: np.ndarray, start: int, end: int, node: int, node_start: int, node_end: int) -> float:
     """Helper function for sum operation, optimized with Numba."""
     if start == node_start and end == node_end:
@@ -25,7 +25,7 @@ def _operate_helper_sum(tree: np.ndarray, start: int, end: int, node: int, node_
             right = _operate_helper_sum(tree, mid + 1, end, 2 * node + 1, mid + 1, node_end)
             return left + right
 
-@numba.jit(nopython=True)
+@njit
 def _operate_helper_min(tree: np.ndarray, start: int, end: int, node: int, node_start: int, node_end: int) -> float:
     """Helper function for min operation, optimized with Numba."""
     if start == node_start and end == node_end:
@@ -41,7 +41,7 @@ def _operate_helper_min(tree: np.ndarray, start: int, end: int, node: int, node_
             right = _operate_helper_min(tree, mid + 1, end, 2 * node + 1, mid + 1, node_end)
             return min(left, right)
 
-@numba.jit(nopython=True)
+@njit
 def _update_tree_sum(tree: np.ndarray, idx: int, val: float, capacity: int):
     """Update the tree for sum operation, optimized with Numba."""
     idx += capacity
@@ -51,7 +51,7 @@ def _update_tree_sum(tree: np.ndarray, idx: int, val: float, capacity: int):
         tree[idx] = tree[2 * idx] + tree[2 * idx + 1]
         idx //= 2
 
-@numba.jit(nopython=True)
+@njit
 def _update_tree_min(tree: np.ndarray, idx: int, val: float, capacity: int):
     """Update the tree for min operation, optimized with Numba."""
     idx += capacity
@@ -61,7 +61,7 @@ def _update_tree_min(tree: np.ndarray, idx: int, val: float, capacity: int):
         tree[idx] = min(tree[2 * idx], tree[2 * idx + 1])
         idx //= 2
 
-@numba.jit(nopython=True)
+@njit
 def _retrieve_sum(tree: np.ndarray, upperbound: float, capacity: int) -> int:
     """Retrieve the index for sum tree, optimized with Numba."""
     idx = 1
@@ -74,6 +74,28 @@ def _retrieve_sum(tree: np.ndarray, upperbound: float, capacity: int) -> int:
             upperbound -= tree[left]
             idx = right
     return idx - capacity
+
+@njit
+def _batch_update_tree_sum(tree: np.ndarray, indices: np.ndarray, values: np.ndarray, capacity: int):
+    for i in range(len(indices)):
+        idx = indices[i] + capacity
+        tree[idx] = values[i]
+        idx //= 2
+        while idx >= 1:
+            tree[idx] = tree[2 * idx] + tree[2 * idx + 1]
+            idx //= 2
+
+@njit
+def _batch_update_tree_min(tree: np.ndarray, indices: np.ndarray, values: np.ndarray, capacity: int):
+    for i in range(len(indices)):
+        idx = indices[i] + capacity
+        tree[idx] = values[i]
+        idx //= 2
+        while idx >= 1:
+            left = tree[2 * idx]
+            right = tree[2 * idx + 1]
+            tree[idx] = left if left < right else right
+            idx //= 2
 
 class SegmentTree:
     """Base SegmentTree class with Numba optimization."""
@@ -130,6 +152,9 @@ class SumSegmentTree(SegmentTree):
         assert 0 <= upperbound <= total_sum + 1e-5, f"upperbound: {upperbound}, total_sum: {total_sum}"
         return _retrieve_sum(self.tree, upperbound, self.capacity)
 
+    def batch_update(self, indices: np.ndarray, values: np.ndarray):
+        return _batch_update_tree_sum(self.tree, indices, values, self.capacity)
+
 class MinSegmentTree(SegmentTree):
     """MinSegmentTree optimized with Numba."""
     def __init__(self, capacity: int):
@@ -140,3 +165,6 @@ class MinSegmentTree(SegmentTree):
     def min(self, start: int = 0, end: int = 0) -> float:
         """Returns min(arr[start], ...,  arr[end])."""
         return self.operate(start, end)
+
+    def batch_update(self, indices: np.ndarray, values: np.ndarray):
+        return _batch_update_tree_min(self.tree, indices, values, self.capacity)

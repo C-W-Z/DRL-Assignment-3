@@ -2,7 +2,7 @@ import gym, pickle
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from nes_py.wrappers import JoypadSpace
-from student_agent_origin import Agent
+from student_agent import Agent
 
 # 創建環境
 env = gym_super_mario_bros.make('SuperMarioBros-v0')
