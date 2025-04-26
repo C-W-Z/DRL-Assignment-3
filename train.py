@@ -4,7 +4,7 @@ import random
 # import pickle
 from collections import deque, namedtuple
 from typing import Dict, List, Tuple
-import cv2
+
 import gym
 import gym_super_mario_bros
 from nes_py.wrappers import JoypadSpace
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# from torchvision import transforms as T
+from torchvision import transforms as T
 from tqdm import tqdm
 # from PIL import Image
 from numba import njit
@@ -32,8 +32,8 @@ MEMORY_SIZE             = 50000
 BATCH_SIZE              = 64
 GAMMA                   = 0.99
 TARGET_UPDATE           = 10000
-NOISY_STD_INIT          = 2.5
-LR                      = 0.00025
+NOISY_STD_INIT          = 0.5
+LR                      = 0.0001
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -67,14 +67,14 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 # 1. Environment Wrappers
 # -----------------------------
 class SkipAndMax(gym.Wrapper):
-    def __init__(self, env, skip):
+    def __init__(self, env, skip=4):
         super().__init__(env)
         self._skip = skip
         self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
 
     def step(self, action):
         total_reward = 0
-        done = False
+        done = None
         for i in range(self._skip):
             obs, reward, done, info = self.env.step(action)
             self._obs_buffer[i & 1] = np.asarray(obs)
@@ -90,27 +90,19 @@ class SkipAndMax(gym.Wrapper):
         self._obs_buffer[0] = self._obs_buffer[1] = obs
         return obs
 
-class GrayScaleResizeCrop(gym.ObservationWrapper):
+class GrayScaleResize(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        # old_shape = gym.spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8).shape
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Grayscale(),
+            T.Resize((84, 84)),
+            T.ToTensor() # scaled to [0.0, 1.0]
+        ])
+        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 84), dtype=np.float32)
 
     def observation(self, obs):
-        return GrayScaleResizeCrop.process(obs)
-
-    @staticmethod
-    def process(frame):
-        frame = np.asarray(frame)
-        assert frame.shape == (240, 256, 3), "Wrong resolution."
-        # 使用 OpenCV 轉灰度
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
-        # 縮放到 (110, 84)，然後裁剪
-        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
-        frame = frame[18:102, :]  # (84, 84)
-        # 轉為 (1, 84, 84)，規範化到 [0, 1]
-        return frame.astype(np.float32)[np.newaxis, :, :]
-        # assert frame.shape == (1, 84, 84)
+        return self.transform(obs)
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, n_steps=4):
@@ -138,7 +130,7 @@ def make_env():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = SkipAndMax(env, skip=SKIP_FRAMES)
-    env = GrayScaleResizeCrop(env)
+    env = GrayScaleResize(env)
     env = FrameStack(env, n_steps=STACK_FRAMES)
     env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
     return env
@@ -171,7 +163,7 @@ class NoisyLinear(nn.Module):
     def reset_noise(self):
         epsilon_in = self.scale_noise(self.in_features)
         epsilon_out = self.scale_noise(self.out_features)
-        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
         self.bias_epsilon.copy_(epsilon_out)
 
     def forward(self, x):
@@ -183,9 +175,10 @@ class NoisyLinear(nn.Module):
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
-    def scale_noise(self, size) -> torch.Tensor:
+    @staticmethod
+    def scale_noise(size):
         x = torch.randn(size)
-        return x.sign().mul(x.abs().sqrt())
+        return x.sign() * x.abs().sqrt()
 
 # -----------------------------
 # 3. Intrinsic Curiosity Module
@@ -262,7 +255,7 @@ class DuelingDistNetwork(nn.Module):
         return dist
 
     def get_features(self, x):
-        return self.features(x / 255.0)
+        return self.features(x)
 
     def reset_noise(self):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
@@ -570,7 +563,8 @@ def plot_figure(agent: Agent, episode: int):
     plt.close()
     tqdm.write(f"Plot saved to {save_path}")
 
-def evaluation(eval_env, agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+    eval_env = make_env()
     state = eval_env.reset()
     e_reward = 0
     done = False
@@ -578,18 +572,18 @@ def evaluation(eval_env, agent: Agent, episode: int, best_checkpoint_path='model
         e_action = agent.act(state)
         state, reward, done, _ = eval_env.step(e_action)
         e_reward += reward
+    eval_env.close()
     agent.eval_rewards.append(e_reward)
     if e_reward > agent.best_eval_reward:
         agent.best_eval_reward = e_reward
     tqdm.write(f"Eval Reward: {e_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
 
-    if e_reward >= 2000 and e_reward == agent.best_eval_reward:
+    if e_reward >= 4000 and e_reward == agent.best_eval_reward:
         agent.save_model(best_checkpoint_path)
         tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
 
 def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env()
-    eval_env = make_env()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     agent = Agent(env.observation_space.shape, env.action_space.n, device)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -659,7 +653,7 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
-            evaluation(eval_env, agent, ep, best_checkpoint_path)
+            evaluation(agent, ep, best_checkpoint_path)
 
         # Plot
         if ep % PLOT_INTERVAL == 0:
@@ -675,7 +669,6 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
     progress_bar.close()
     env.close()
-    eval_env.close()
 
 if __name__ == '__main__':
     train(num_episodes=100000)
