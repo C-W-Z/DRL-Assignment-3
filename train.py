@@ -4,7 +4,7 @@ import random
 # import pickle
 from collections import deque, namedtuple
 from typing import Dict, List, Tuple
-
+import cv2
 import gym
 import gym_super_mario_bros
 from nes_py.wrappers import JoypadSpace
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import transforms as T
+# from torchvision import transforms as T
 from tqdm import tqdm
 # from PIL import Image
 from numba import njit
@@ -33,7 +33,7 @@ BATCH_SIZE              = 64
 GAMMA                   = 0.99
 TARGET_UPDATE           = 10000
 NOISY_STD_INIT          = 2.5
-LR                      = 0.00025
+LR                      = 0.0001
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -61,75 +61,74 @@ PLOT_INTERVAL           = 10
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
+GAMMA_POW_N_STEP = GAMMA ** N_STEP
+
 # -----------------------------
 # 1. Environment Wrappers
 # -----------------------------
-class SkipAndMax(gym.Wrapper):
-    def __init__(self, env, skip=4):
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip):
         super().__init__(env)
-        self.obs_buffer = deque(maxlen=2)
-        self._skip = skip
+        self.skip = skip
 
     def step(self, action):
         total_reward = 0.0
-        done = None
-        for _ in range(self._skip):
+        done = False
+        for _ in range(self.skip):
             obs, reward, done, info = self.env.step(action)
-            self.obs_buffer.append(obs)
             total_reward += reward
             if done:
                 break
-        max_frame = np.max(np.stack(self.obs_buffer), axis=0)
-        return max_frame, total_reward, done, info
+        return obs, total_reward, done, info
 
-    def reset(self):
-        self.obs_buffer.clear()
-        obs = self.env.reset()
-        self.obs_buffer.append(obs)
-        return obs
-
-class GrayScaleResize(gym.ObservationWrapper):
+class GrayScaleResizeCrop(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.transform = T.Compose([
-            T.ToPILImage(), T.Grayscale(), T.Resize((84, 84)), T.ToTensor()
-        ])
-        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 84), dtype=np.float32)
+        # old_shape = gym.spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8).shape
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
 
     def observation(self, obs):
-        return self.transform(obs)
+        return GrayScaleResizeCrop.process(obs)
+
+    @staticmethod
+    def process(frame):
+        frame = np.asarray(frame)
+        assert frame.shape == (240, 256, 3), "Wrong resolution."
+        # 使用 OpenCV 轉灰度
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
+        # 縮放到 (110, 84)，然後裁剪
+        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
+        frame = frame[18:102, :]  # (84, 84)
+        # 轉為 (1, 84, 84)，規範化到 [0, 1]
+        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
 
 class FrameStack(gym.Wrapper):
-    def __init__(self, env, n_steps):
+    def __init__(self, env, n_steps=4):
         super().__init__(env)
         self.n_steps = n_steps
         shp = env.observation_space.shape
         self.observation_space = gym.spaces.Box(0, 1, shape=(shp[0] * n_steps, shp[1], shp[2]), dtype=np.float32)
         self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
-        self.ptr = 0  # 指向最新幀的位置
 
     def reset(self):
         obs = self.env.reset()
         obs = np.asarray(obs)
         for i in range(self.n_steps):
             self.frames[i] = obs
-        self.ptr = 0
         return self.frames
 
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
         obs = np.asarray(obs)
-        self.frames[self.ptr] = obs
-        self.ptr = (self.ptr + 1) % self.n_steps
-        # 按順序拼接
-        indices = [(self.ptr + i) % self.n_steps for i in range(self.n_steps)]
-        return self.frames[indices], reward, done, info
+        self.frames[:-1] = self.frames[1:]
+        self.frames[-1] = obs
+        return self.frames, reward, done, info
 
 def make_env():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = SkipAndMax(env, skip=SKIP_FRAMES)
-    env = GrayScaleResize(env)
+    env = SkipFrame(env, skip=SKIP_FRAMES)
+    env = GrayScaleResizeCrop(env)
     env = FrameStack(env, n_steps=STACK_FRAMES)
     env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
     return env
@@ -138,17 +137,19 @@ def make_env():
 # 2. Noisy Linear Layer
 # -----------------------------
 class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=NOISY_STD_INIT):
+    def __init__(self, in_features: int, out_features: int, std_init: float=NOISY_STD_INIT):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
+        # 參數
         self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.register_buffer("weight_epsilon", torch.Tensor(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.Tensor(out_features))
         self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
-        self.register_buffer("bias_epsilon", torch.Tensor(out_features))
+        # 提前計算的噪音
+        self.register_buffer("weight_noise", torch.Tensor(out_features, in_features))
+        self.register_buffer("bias_noise", torch.Tensor(out_features))
         self.reset_parameters()
         self.reset_noise()
 
@@ -162,22 +163,27 @@ class NoisyLinear(nn.Module):
     def reset_noise(self):
         epsilon_in = self.scale_noise(self.in_features)
         epsilon_out = self.scale_noise(self.out_features)
-        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
-        self.bias_epsilon.copy_(epsilon_out)
+        # 使用 torch.outer 替代 ger
+        weight_epsilon = torch.outer(epsilon_out, epsilon_in)
+        # 提前計算 weight_sigma * weight_epsilon
+        self.weight_noise.copy_(self.weight_sigma * weight_epsilon)
+        self.bias_noise.copy_(self.bias_sigma * epsilon_out)
 
     def forward(self, x):
         if self.training:
-            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
-            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
+            # 只需加法，減少逐元素乘法
+            weight = self.weight_mu + self.weight_noise
+            bias = self.bias_mu + self.bias_noise
         else:
             weight = self.weight_mu
             bias = self.bias_mu
         return F.linear(x, weight, bias)
 
-    @staticmethod
-    def scale_noise(size):
-        x = torch.randn(size)
-        return x.sign() * x.abs().sqrt()
+    def scale_noise(self, size) -> torch.Tensor:
+        # 確保在 GPU 上生成隨機數
+        x = torch.randn(size, device=self.weight_mu.device)
+        # 優化計算
+        return x.sign().mul(x.abs().sqrt())
 
 # -----------------------------
 # 3. Intrinsic Curiosity Module
@@ -197,6 +203,7 @@ class ICM(nn.Module):
             nn.Linear(embed_dim + n_actions, 512), nn.ReLU(),
             nn.Linear(512, embed_dim)
         )
+
     def forward(self, feat, next_feat, action):
         phi = self.encoder(feat)
         phi_next = self.encoder(next_feat)
@@ -230,8 +237,9 @@ class DuelingDistNetwork(nn.Module):
         self.adv_noisy = NoisyLinear(feat_dim, 512)
         self.adv = NoisyLinear(512, n_actions * atom_size)
         self.feat_dim = feat_dim
+
     def forward(self, x):
-        x = self.features(x / 255.0)
+        x = self.features(x)
         value = F.relu(self.value_noisy(x))
         value = self.value(value).view(-1, 1, self.atom_size)
         adv = F.relu(self.adv_noisy(x))
@@ -240,8 +248,9 @@ class DuelingDistNetwork(nn.Module):
         dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
         q = (dist * self.support).sum(dim=2)
         return q
+
     def dist(self, x):
-        x = self.features(x / 255.0)
+        x = self.features(x)
         value = F.relu(self.value_noisy(x))
         value = self.value(value).view(-1, 1, self.atom_size)
         adv = F.relu(self.adv_noisy(x))
@@ -249,8 +258,7 @@ class DuelingDistNetwork(nn.Module):
         q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
         dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
         return dist
-    def get_features(self, x):
-        return self.features(x / 255.0)
+
     def reset_noise(self):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
             m.reset_noise()
@@ -284,19 +292,18 @@ def _compute_weights(p_samples: np.ndarray, size: int, beta: float, max_weight: 
     return weights / max_weight
 
 class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape, size, batch_size, alpha, beta_start, beta_frames, n_step, gamma):
+    def __init__(self, obs_shape, size, batch_size, alpha, beta_start, beta_frames):
         self.obs_shape = obs_shape
         self.max_size, self.batch_size = size, batch_size
         self.alpha, self.beta_start, self.beta_frames = alpha, beta_start, beta_frames
         self.beta_by_frame = lambda f: min(1.0, beta_start + f * (1.0 - beta_start) / beta_frames)
-        self.n_step, self.gamma = n_step, gamma
         self.obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.next_obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.acts_buf = np.zeros([size], dtype=np.int64)
         self.rews_buf = np.zeros([size], dtype=np.float32)
         self.done_buf = np.zeros([size], dtype=np.float32)
         self.ptr, self.size = 0, 0
-        self.n_step_buffer = deque(maxlen=n_step)
+        self.n_step_buffer = deque(maxlen=N_STEP)
         self.max_priority, self.tree_ptr = 1.0, 0
         tree_capacity = 1
         while tree_capacity < size:
@@ -306,7 +313,7 @@ class PrioritizedReplayBuffer:
 
     def store(self, state, action, reward, next_state, done):
         self.n_step_buffer.append(Exp(state, action, reward, next_state, done))
-        if len(self.n_step_buffer) < self.n_step:
+        if len(self.n_step_buffer) < N_STEP:
             return
         reward_n, next_state_n, done_n = self._get_n_step()
         self.obs_buf[self.ptr] = self.n_step_buffer[0].state
@@ -323,7 +330,7 @@ class PrioritizedReplayBuffer:
     def _get_n_step(self):
         # reward, next_state, done = self.n_step_buffer[-1].reward, self.n_step_buffer[-1].next_state, self.n_step_buffer[-1].done
         # for trans in reversed(list(self.n_step_buffer)[:-1]):
-        #     reward = trans.reward + self.gamma * reward * (1 - trans.done)
+        #     reward = trans.reward + GAMMA * reward * (1 - trans.done)
         #     next_state, done = (trans.next_state, trans.done) if trans.done else (next_state, done)
         # return reward, next_state, done
 
@@ -333,7 +340,7 @@ class PrioritizedReplayBuffer:
         last_next_state = self.n_step_buffer[-1].next_state
         last_done = float(self.n_step_buffer[-1].done)
         # 用 numba 加速計算
-        reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, self.gamma)
+        reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, GAMMA)
         return reward, next_state, done
 
     def sample(self, frame_idx):
@@ -402,7 +409,7 @@ class PrioritizedReplayBuffer:
         self.done_buf = state['done_buf']
         self.ptr = state['ptr']
         self.size = state['size']
-        self.n_step_buffer = deque(state['n_step_buffer'], maxlen=self.n_step)
+        self.n_step_buffer = deque(state['n_step_buffer'], maxlen=N_STEP)
         self.sum_tree.tree = state['sum_tree']
         self.min_tree.tree = state['min_tree']
         self.tree_ptr = state['tree_ptr']
@@ -423,17 +430,19 @@ class Agent:
         self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
         self.icm = ICM(self.online.feat_dim, n_actions).to(device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, BETA_START, BETA_FRAMES, N_STEP, GAMMA)
+        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, BETA_START, BETA_FRAMES)
         self.frame_idx = 0
-        self.total_steps = 0
         self.rewards = []
         self.losses = []
-        self.best_avg_reward = -np.inf
+        self.eval_rewards = []  # 新增：存儲所有評估獎勵
+        self.best_eval_reward = -np.inf  # 新增：追蹤最佳評估獎勵
+
     def act(self, state):
         s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q = self.online(s_t)
         return int(q.argmax(1).item())
+
     def learn(self):
         sample = self.buffer.sample(self.frame_idx)
         if sample is None:
@@ -450,7 +459,7 @@ class Agent:
         with torch.no_grad():
             next_action = self.online(next_state).argmax(1)
             next_dist = self.target.dist(next_state)[range(BATCH_SIZE), next_action]
-            t_z = r_ext.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA ** N_STEP) * self.support.unsqueeze(0)
+            t_z = r_ext.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
             t_z = t_z.clamp(min=V_MIN, max=V_MAX)
             b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
             l = b.floor().long()
@@ -463,8 +472,8 @@ class Agent:
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
         # ICM loss
-        feat = self.online.get_features(state)
-        next_feat = self.online.get_features(next_state)
+        feat = self.online.features(state)
+        next_feat = self.online.features(next_state)
         logits, pred_phi_n, true_phi_n = self.icm(feat.detach(), next_feat.detach(), action)
         inv_loss = F.cross_entropy(logits, action)
         fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
@@ -475,7 +484,7 @@ class Agent:
         total_r = r_ext + int_r
         curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
         with torch.no_grad():
-            t_z = total_r.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA ** N_STEP) * self.support.unsqueeze(0)
+            t_z = total_r.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
             t_z = t_z.clamp(min=V_MIN, max=V_MAX)
             b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
             l = b.floor().long()
@@ -500,6 +509,7 @@ class Agent:
         for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
             target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
         return dqn_loss.item(), icm_loss.item(), int_r.mean().item()
+
     def save_model(self, path):
         torch.save({
             'online': self.online.state_dict(),
@@ -508,11 +518,13 @@ class Agent:
             'icm': self.icm.state_dict(),
             'icm_optimizer': self.icm_optimizer.state_dict(),
             'frame_idx': self.frame_idx,
-            'total_steps': self.total_steps,
             'rewards': self.rewards,
             'losses': self.losses,
+            'eval_rewards': self.eval_rewards,
+            'best_eval_reward': self.best_eval_reward,
             'buffer_state': self.buffer.get_state(),
         }, path, pickle_protocol=4)
+
     def load_model(self, path, eval_mode=False):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.online.load_state_dict(checkpoint['online'])
@@ -521,9 +533,10 @@ class Agent:
         self.icm.load_state_dict(checkpoint['icm'])
         self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
         self.frame_idx = checkpoint['frame_idx']
-        self.total_steps = checkpoint['total_steps']
         self.rewards = checkpoint['rewards']
         self.losses = checkpoint['losses']
+        self.eval_rewards = checkpoint.get('eval_rewards', [])
+        self.best_eval_reward = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
         if eval_mode:
             self.online.eval()
@@ -532,6 +545,43 @@ class Agent:
 # -----------------------------
 # 7. Training Loop
 # -----------------------------
+def plot_figure(agent: Agent, episode: int):
+    plt.figure(figsize=(20, 5))
+    plt.subplot(131)
+    avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
+    plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
+    plt.plot(agent.rewards, label='Reward')
+    plt.legend()
+    plt.subplot(132)
+    plt.title("Loss")
+    plt.plot(agent.losses, label='DQN Loss')
+    plt.legend()
+    plt.subplot(133)
+    plt.title("Eval Reward")
+    plt.plot([i * EVAL_INTERVAL for i in range(len(agent.eval_rewards))], agent.eval_rewards, label='Eval Reward')
+    plt.legend()
+    save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
+    plt.savefig(save_path, bbox_inches='tight')
+    plt.close()
+    tqdm.write(f"Plot saved to {save_path}")
+
+def evaluation(env, agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+    state = env.reset()
+    e_reward = 0
+    done = False
+    while not done:
+        e_action = agent.act(state)
+        state, reward, done, _ = env.step(e_action)
+        e_reward += reward
+    agent.eval_rewards.append(e_reward)
+    if e_reward > agent.best_eval_reward:
+        agent.best_eval_reward = e_reward
+    tqdm.write(f"Eval Reward: {e_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
+
+    if e_reward >= 2000 and e_reward == agent.best_eval_reward:
+        agent.save_model(best_checkpoint_path)
+        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
+
 def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -555,9 +605,7 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
             state = env.reset()
 
     # Training
-    hist = {'rewards': agent.rewards, 'losses': agent.losses, 'stages': [], 'durations': [], 'eval_rewards': []}
     progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
-    # chunk_time = time.time()
 
     for ep in range(start_ep, num_episodes + 1):
         state = env.reset()
@@ -565,7 +613,6 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
         done = False
         while not done:
             agent.frame_idx += 1
-            agent.total_steps += 1
             action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
@@ -596,59 +643,21 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
             if agent.frame_idx >= MAX_FRAMES:
                 break
 
-        hist['rewards'].append(ep_reward)
-        hist['stages'].append(env.unwrapped._stage)
+        agent.rewards.append(ep_reward)
         status = "TERMINATED" if done_flag else "TRUNCATED"
 
         # Logging
         if ep % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(hist['rewards'][-PLOT_INTERVAL:]) if len(hist['rewards']) >= PLOT_INTERVAL else np.mean(hist['rewards'])
+            avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
             tqdm.write(f"Episode {ep} | Reward {ep_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Status {status}")
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
-            eval_env = make_env()
-            # eval_rewards = []
-            # for _ in range(10):
-            e_state = eval_env.reset()
-            e_reward = 0
-            e_done = False
-            e_steps = 0
-            while not e_done and e_steps < 2000:
-                e_action = agent.act(e_state)
-                e_state, e_r, e_done, _ = eval_env.step(e_action)
-                e_reward += e_r
-                e_steps += 1
-            # eval_rewards.append(e_reward)
-            eval_env.close()
-            # avg_eval = np.mean(eval_rewards)
-            hist['eval_rewards'].append(e_reward)
-            tqdm.write(f"Eval Reward: {e_reward:.1f}")
-
-            if e_reward >= 2000 and (len(hist['eval_rewards']) == 1 or e_reward > max(hist['eval_rewards'][:-1])):
-                agent.save_model(best_checkpoint_path)
-                tqdm.write(f"Best model saved at episode {ep}")
+            evaluation(env, agent, ep, best_checkpoint_path)
 
         # Plot
         if ep % PLOT_INTERVAL == 0:
-            plt.figure(figsize=(20, 5))
-            plt.subplot(131)
-            avg_reward = np.mean(hist['rewards'][-PLOT_INTERVAL:]) if len(hist['rewards']) >= PLOT_INTERVAL else np.mean(hist['rewards'])
-            plt.title(f"Episode {ep} | Avg Reward {avg_reward:.2f}")
-            plt.plot(hist['rewards'], label='Reward')
-            plt.legend()
-            plt.subplot(132)
-            plt.title("Loss")
-            plt.plot(hist['losses'], label='DQN Loss')
-            plt.legend()
-            plt.subplot(133)
-            plt.title("Eval Reward")
-            plt.plot([i * EVAL_INTERVAL for i in range(len(hist['eval_rewards']))], hist['eval_rewards'], label='Eval Reward')
-            plt.legend()
-            save_path = os.path.join(PLOT_DIR, f"episode_{ep}.png")
-            plt.savefig(save_path, bbox_inches='tight')
-            plt.close()
-            tqdm.write(f"Plot saved to {save_path}")
+            plot_figure(agent, ep)
 
         # Save model
         if ep % SAVE_INTERVAL == 0:
@@ -660,7 +669,6 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
     progress_bar.close()
     env.close()
-    return hist
 
 if __name__ == '__main__':
     train(num_episodes=100000)
