@@ -54,7 +54,7 @@ DEATH_PENALTY           = -100
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.01
+ICM_ETA                 = 0.05
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 
@@ -232,7 +232,7 @@ class PrioritizedReplayBuffer:
         self.obs_shape = obs_shape
         self.obs_buf = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
         self.next_obs_buf = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
-        self.acts_buf = np.zeros((MEMORY_SIZE,), dtype=np.int64)
+        self.acts_buf = np.zeros((MEMORY_SIZE,), dtype=np.int32)
         self.rews_buf = np.zeros((MEMORY_SIZE,), dtype=np.float32)
         self.done_buf = np.zeros((MEMORY_SIZE,), dtype=np.float32)
         self.size = 0
@@ -355,7 +355,7 @@ class Agent:
         self.buffer = PrioritizedReplayBuffer(obs_shape)
 
         # 初始化損失函數
-        self.dqn_criterion = nn.SmoothL1Loss(reduction='none')  # 用於 DQN Loss，逐元素計算
+        # self.dqn_criterion = nn.SmoothL1Loss(reduction='none')  # 用於 DQN Loss，逐元素計算
         self.inverse_criterion = nn.CrossEntropyLoss(reduction='mean')  # 用於 ICM 的逆向損失
         self.forward_criterion = nn.MSELoss(reduction='mean')  # 用於 ICM 的前向損失
 
@@ -372,6 +372,37 @@ class Agent:
         with torch.no_grad():
             q_value = self.online(state_tensor)
         return int(q_value.argmax(1).item())
+
+    def compute_dqn_loss(self, state, action, reward, next_state, done, weights):
+        curr_dist = self.online.dist(state)
+        curr_dist = curr_dist[range(BATCH_SIZE), action]
+
+        with torch.no_grad():
+            next_action = self.online(next_state).argmax(1)
+            next_dist = self.target.dist(next_state)
+            next_dist = next_dist[range(BATCH_SIZE), next_action]
+
+            t_z = reward.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA_POW_N_STEP) * self.support.unsqueeze(0)
+            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
+            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
+            l = b.floor().long()
+            u = b.ceil().long()
+
+            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long() \
+                .unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
+
+            proj_dist = torch.zeros_like(next_dist)
+            proj_dist.view(-1).index_add_(
+                0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
+            )
+            proj_dist.view(-1).index_add_(
+                0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
+            )
+
+        log_p = torch.log(curr_dist.clamp(min=1e-3))
+        elementwise_loss = -(proj_dist * log_p).sum(1)
+        loss = (weights * elementwise_loss).mean()
+        return loss, elementwise_loss
 
     def learn(self):
         batch, weights, indices = self.buffer.sample(self.frame_idx)
@@ -396,13 +427,14 @@ class Agent:
             intrinsic_rewards = intrinsic_rewards / (intrinsic_rewards.mean() + 1e-6) * external_rewards.mean()
 
         # DQN targets
-        q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        next_actions = self.online(next_states).argmax(1)
-        q_next = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+        # q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # next_actions = self.online(next_states).argmax(1)
+        # q_next = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
         total_rewards = external_rewards + intrinsic_rewards
-        q_target = total_rewards + GAMMA_POW_N_STEP * q_next * (1 - dones)
-        td_value = q_predicted - q_target.detach()
-        dqn_loss = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
+        # q_target = total_rewards + GAMMA_POW_N_STEP * q_next * (1 - dones)
+        # td_value = q_predicted - q_target.detach()
+        # dqn_loss = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
+        dqn_loss, elementwise_loss = self.compute_dqn_loss(states, actions, total_rewards, next_states, dones, weights)
 
         # update DQN & ICM
         self.optimizer.zero_grad()
@@ -414,7 +446,7 @@ class Agent:
 
         self.online.reset_noise()
         self.target.reset_noise()
-        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
+        self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
 
         if self.frame_idx % TARGET_UPDATE == 0:
             if TAU == 1.0:
