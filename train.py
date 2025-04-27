@@ -13,7 +13,7 @@ from numba import njit
 from env_wrapper import make_env
 from segment_tree import SumSegmentTree, MinSegmentTree, _sample_core
 
-Exp = namedtuple('Exp', ['state', 'action', 'reward', 'next_state', 'done'])
+Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'done'])
 
 # -----------------------------
 # Hyperparameters
@@ -26,7 +26,7 @@ MAX_EPISODE_STEPS       = 3000
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.9
-LEARNING_RATE           = 0.00005
+LEARNING_RATE           = 0.0000025
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -38,7 +38,7 @@ NOISY_STD_INIT          = 2.5
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
 BATCH_SIZE              = 32
-GAMMA                   = 0.9
+GAMMA                   = 0.95
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
@@ -54,7 +54,7 @@ DEATH_PENALTY           = -100
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.05
+ICM_ETA                 = 0.01
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 
@@ -247,7 +247,7 @@ class PrioritizedReplayBuffer:
         self.min_tree = MinSegmentTree(tree_capacity)
 
     def store(self, state, action, reward, next_state, done):
-        self.n_step_buffer.append(Exp(state, action, reward, next_state, done))
+        self.n_step_buffer.append(Transition(state, action, reward, next_state, done))
         if len(self.n_step_buffer) < N_STEP:
             return
         reward_n, next_state_n, done_n = self._get_n_step()
@@ -283,7 +283,7 @@ class PrioritizedReplayBuffer:
             beta=_get_beta_by_frame(frame_idx),
             capacity=self.sum_tree.capacity
         )
-        batch = Exp(
+        batch = Transition(
             state=self.obs_buf[indices],
             action=self.acts_buf[indices],
             reward=self.rews_buf[indices],
@@ -471,16 +471,17 @@ def plot_figure(agent: Agent, episode: int):
     plt.subplot(121)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
-    plt.plot(agent.rewards, label='Reward')
-    plt.plot([i * EVAL_INTERVAL for i in range(1, len(agent.eval_rewards) + 1)], agent.eval_rewards, label='Eval Reward')
-    plt.xlim(left=0.0, right=len(agent.rewards))
+    arange = 1 + np.arange(len(agent.rewards))
+    plt.plot(arange, agent.rewards, label='Reward')
+    plt.plot(arange * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
+    plt.xlim(left=1, right=len(agent.rewards))
     plt.legend()
     plt.subplot(122)
     plt.title("Loss")
     plt.plot(agent.icm_losses, label='ICM Loss')
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=min(100.0, max(agent.dqn_losses)))
+    plt.ylim(bottom=0.0,top=max(agent.dqn_losses[-10 * TARGET_UPDATE:] if len(agent.dqn_losses) >= 10 * TARGET_UPDATE else agent.dqn_losses))
     plt.legend()
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -501,11 +502,11 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth
     agent.eval_rewards.append(eval_reward)
     if eval_reward > agent.best_eval_reward:
         agent.best_eval_reward = eval_reward
-    tqdm.write(f"Eval Reward: {eval_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
+    tqdm.write(f"Eval Reward: {eval_reward:.0f} | Best Eval Reward: {agent.best_eval_reward:.0f}")
 
     if eval_reward >= 4000 and eval_reward == agent.best_eval_reward:
         agent.save_model(best_checkpoint_path)
-        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {eval_reward:.1f}")
+        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {eval_reward:.0f}")
 
 def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
@@ -587,7 +588,7 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         # Logging
         if episode % PLOT_INTERVAL == 0:
             avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Episode {episode} | Reward {episode_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {count_truncated}")
+            tqdm.write(f"Episode {episode} | Reward {episode_reward:.0f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {count_truncated}")
             count_truncated = 0
 
         # Evaluation
