@@ -114,24 +114,24 @@ class NoisyLinear(nn.Module):
 # Intrinsic Curiosity Module
 # -----------------------------
 class ICM(nn.Module):
-    def __init__(self, feature_dimension, n_actions, embed_dim=ICM_EMBED_DIM):
+    def __init__(self, feature_dimension: int, n_actions: int, embed_dimension: int=ICM_EMBED_DIM):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feature_dimension, embed_dim),
+            nn.Linear(feature_dimension, embed_dimension),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dimension, embed_dimension),
             nn.ReLU()
         )
         self.inverse_model = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
+            nn.Linear(embed_dimension * 2, 512),
             nn.ReLU(),
             nn.Linear(512, n_actions)
         )
         self.forward_model = nn.Sequential(
-            nn.Linear(embed_dim + n_actions, 512),
+            nn.Linear(embed_dimension + n_actions, 512),
             nn.ReLU(),
-            nn.Linear(512, embed_dim)
+            nn.Linear(512, embed_dimension)
         )
 
     def forward(self, features, next_features, action):
@@ -228,20 +228,21 @@ def _get_beta_by_frame(frame_idx):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape, size):
+    def __init__(self, obs_shape: Tuple):
         self.obs_shape = obs_shape
-        self.max_size = size
-        self.obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
-        self.next_obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.int64)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
-        self.ptr, self.size = 0, 0
+        self.obs_buf = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
+        self.next_obs_buf = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
+        self.acts_buf = np.zeros((MEMORY_SIZE,), dtype=np.int64)
+        self.rews_buf = np.zeros((MEMORY_SIZE,), dtype=np.float32)
+        self.done_buf = np.zeros((MEMORY_SIZE,), dtype=np.float32)
+        self.size = 0
+        self.ptr = 0
         self.n_step_buffer = deque(maxlen=N_STEP)
-        self.max_priority, self.tree_ptr = 1.0, 0
+        self.max_priority = 1.0
+        self.tree_ptr = 0
         tree_capacity = 1
-        while tree_capacity < size:
-            tree_capacity *= 2
+        while tree_capacity < MEMORY_SIZE:
+            tree_capacity <<= 1 # *= 2
         self.sum_tree = SumSegmentTree(tree_capacity)
         self.min_tree = MinSegmentTree(tree_capacity)
 
@@ -257,9 +258,9 @@ class PrioritizedReplayBuffer:
         self.done_buf[self.ptr] = done_n
         self.sum_tree[self.tree_ptr] = self.max_priority ** ALPHA
         self.min_tree[self.tree_ptr] = self.max_priority ** ALPHA
-        self.tree_ptr = (self.tree_ptr + 1) % self.max_size
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
+        self.tree_ptr = (self.tree_ptr + 1) % MEMORY_SIZE
+        self.ptr = (self.ptr + 1) % MEMORY_SIZE
+        self.size = min(self.size + 1, MEMORY_SIZE)
 
     def _get_n_step(self):
         # 提取 n_step_buffer 的資料為 NumPy 陣列
@@ -351,7 +352,12 @@ class Agent:
         self.icm = ICM(self.online.feature_dimension, n_actions).to(self.device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
 
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE)
+        self.buffer = PrioritizedReplayBuffer(obs_shape)
+
+        # 初始化損失函數
+        self.dqn_criterion = nn.SmoothL1Loss(reduction='none')  # 用於 DQN Loss，逐元素計算
+        self.inverse_criterion = nn.CrossEntropyLoss(reduction='mean')  # 用於 ICM 的逆向損失
+        self.forward_criterion = nn.MSELoss(reduction='mean')  # 用於 ICM 的前向損失
 
         self.frame_idx = 0
         self.rewards = []
@@ -362,10 +368,10 @@ class Agent:
         self.best_eval_reward = -np.inf
 
     def act(self, state):
-        s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q = self.online(s_t)
-        return int(q.argmax(1).item())
+            q_value = self.online(state_tensor)
+        return int(q_value.argmax(1).item())
 
     def learn(self):
         batch, weights, indices = self.buffer.sample(self.frame_idx)
@@ -381,36 +387,34 @@ class Agent:
         next_features = self.online.get_features(next_states)
 
         # ICM forward
-        logits, predicted_phi_next, true_phi_next = self.icm(features, next_features, actions)  # 移除 detach
-        inverse_loss = F.cross_entropy(logits, actions)
-        forward_loss = F.mse_loss(predicted_phi_next, true_phi_next.detach())
+        logits, predicted_phi_next, true_phi_next = self.icm(features, next_features, actions)
+        inverse_loss = self.inverse_criterion(logits, actions)
+        forward_loss = self.forward_criterion(predicted_phi_next, true_phi_next.detach())
         icm_loss = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
             intrinsic_rewards = ICM_ETA * 0.5 * (predicted_phi_next - true_phi_next).pow(2).sum(dim=1)
-            intrinsic_rewards = intrinsic_rewards / (intrinsic_rewards.mean() + 1e-6) * external_rewards.mean()  # 正規化內在獎勵
+            intrinsic_rewards = intrinsic_rewards / (intrinsic_rewards.mean() + 1e-6) * external_rewards.mean()
 
         # DQN targets
         q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         next_actions = self.online(next_states).argmax(1)
         q_next = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
         total_rewards = external_rewards + intrinsic_rewards
-        q_target = total_rewards + (GAMMA_POW_N_STEP) * q_next * (1 - dones)
+        q_target = total_rewards + GAMMA_POW_N_STEP * q_next * (1 - dones)
         td_value = q_predicted - q_target.detach()
-        dqn_loss = (F.smooth_l1_loss(q_predicted, q_target.detach(), reduction='none') * weights).mean()
+        dqn_loss = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
 
         # update DQN & ICM
         self.optimizer.zero_grad()
         self.icm_optimizer.zero_grad()
         dqn_loss.backward()
         icm_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
-        torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
         self.optimizer.step()
         self.icm_optimizer.step()
 
         self.online.reset_noise()
         self.target.reset_noise()
-        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())  # 使用 abs
+        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
         if self.frame_idx % TARGET_UPDATE == 0:
             if TAU == 1.0:
@@ -418,10 +422,10 @@ class Agent:
                 self.target.load_state_dict(self.online.state_dict())
             else:
                 # Soft target update
-                for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
-                    target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
+                for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
+                    target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
 
-        return dqn_loss.item(), icm_loss.item(), intrinsic_rewards.mean().item()  # 返回損失值和內在獎勵
+        return dqn_loss.item(), icm_loss.item(), intrinsic_rewards.mean().item() # 返回損失值和內在獎勵
 
     def save_model(self, path):
         torch.save({
