@@ -33,7 +33,7 @@ BATCH_SIZE              = 64
 GAMMA                   = 0.9
 TARGET_UPDATE           = 10000
 NOISY_STD_INIT          = 2.5
-LR                      = 0.00025
+LR                      = 0.000001
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -214,6 +214,11 @@ class ICM(nn.Module):
     def forward(self, feat, next_feat, action):
         phi = self.encoder(feat)
         phi_next = self.encoder(next_feat)
+
+        # Normalize embeddings to unit L2 norm
+        phi = F.normalize(phi, p=2, dim=1)
+        phi_next = F.normalize(phi_next, p=2, dim=1)
+
         inv_in = torch.cat([phi, phi_next], dim=1)
         logits = self.inverse_model(inv_in)
         a_onehot = F.one_hot(action, logits.size(-1)).float()
@@ -267,7 +272,7 @@ class DuelingDistNetwork(nn.Module):
         return dist
 
     def get_features(self, x):
-        return self.features(x / 255.0)
+        return self.features(x)
 
     def reset_noise(self):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
@@ -509,14 +514,26 @@ class Agent:
         dqn_loss = (elementwise_loss * w).mean()
 
         # Optimize
+        # self.optimizer.zero_grad()
+        # self.icm_optimizer.zero_grad()
+        # (dqn_loss + icm_loss).backward()
+        # torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
+        # self.optimizer.step()
+        # self.icm_optimizer.step()
+        # self.online.reset_noise()
+        # self.target.reset_noise()
+
+        # Optimize DQN and ICM separately
         self.optimizer.zero_grad()
-        self.icm_optimizer.zero_grad()
-        (dqn_loss + icm_loss).backward()
-        torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
+        dqn_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
         self.optimizer.step()
+
+        self.icm_optimizer.zero_grad()
+        icm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
         self.icm_optimizer.step()
-        self.online.reset_noise()
-        self.target.reset_noise()
+
         self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
 
         # Soft target update
