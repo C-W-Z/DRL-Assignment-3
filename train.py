@@ -26,7 +26,7 @@ MAX_EPISODE_STEPS       = 3000
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.9
-LEARNING_RATE           = 0.0001
+LEARNING_RATE           = 0.00005
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -54,7 +54,7 @@ DEATH_PENALTY           = -100
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.1
+ICM_ETA                 = 0.05
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 
@@ -114,11 +114,11 @@ class NoisyLinear(nn.Module):
 # Intrinsic Curiosity Module
 # -----------------------------
 class ICM(nn.Module):
-    def __init__(self, feat_dim, n_actions, embed_dim=ICM_EMBED_DIM):
+    def __init__(self, feature_dimension, n_actions, embed_dim=ICM_EMBED_DIM):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(feat_dim, embed_dim),
+            nn.Linear(feature_dimension, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU()
@@ -137,11 +137,11 @@ class ICM(nn.Module):
     def forward(self, features, next_features, action):
         phi = self.encoder(features)
         phi_next = self.encoder(next_features)
-        inv_in = torch.cat([phi, phi_next], dim=1)
-        logits = self.inverse_model(inv_in)
-        a_onehot = F.one_hot(action, logits.size(-1)).float()
-        fwd_in = torch.cat([phi, a_onehot], dim=1)
-        pred_phi_next = self.forward_model(fwd_in)
+        inverse_input = torch.cat([phi, phi_next], dim=1)
+        logits = self.inverse_model(inverse_input)
+        action_onehot = F.one_hot(action, logits.size(-1)).float()
+        forward_input = torch.cat([phi, action_onehot], dim=1)
+        pred_phi_next = self.forward_model(forward_input)
         return logits, pred_phi_next, phi_next
 
 # -----------------------------
@@ -165,11 +165,11 @@ class DuelingDistNetwork(nn.Module):
 
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, 84, 84)
-            self.feat_dim = self.feature_layer(dummy).shape[1]
+            self.feature_dimension = self.feature_layer(dummy).shape[1]
 
-        self.advantage_hidden_layer = NoisyLinear(self.feat_dim, 512)
-        self.advantage_layer = NoisyLinear(512, n_actions * ATOM_SIZE)
-        self.value_hidden_layer = NoisyLinear(self.feat_dim, 512)
+        self.advantage_hidden_layer = NoisyLinear(self.feature_dimension, 512)
+        self.advantage_layer = NoisyLinear(512, self.n_actions * ATOM_SIZE)
+        self.value_hidden_layer = NoisyLinear(self.feature_dimension, 512)
         self.value_layer = NoisyLinear(512, ATOM_SIZE)
 
     def get_features(self, x):
@@ -348,7 +348,7 @@ class Agent:
 
         self.optimizer = optim.Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
-        self.icm = ICM(self.online.feat_dim, n_actions).to(self.device)
+        self.icm = ICM(self.online.feature_dimension, n_actions).to(self.device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
 
         self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE)
@@ -367,15 +367,6 @@ class Agent:
             q = self.online(s_t)
         return int(q.argmax(1).item())
 
-    # def act(self, state):
-    #     epsilon = max(EPSILON_MIN, EPSILON_START - self.frame_idx * (EPSILON_START - EPSILON_MIN) / EPSILON_FRAMES)
-    #     if np.random.rand() < epsilon:
-    #         return np.random.randint(self.n_actions)
-    #     s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-    #     with torch.no_grad():
-    #         q = self.online(s_t)
-    #     return int(q.argmax(1).item())
-
     def learn(self):
         batch, weights, indices = self.buffer.sample(self.frame_idx)
         states = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
@@ -390,22 +381,22 @@ class Agent:
         next_features = self.online.get_features(next_states)
 
         # ICM forward
-        logits, pred_phi_n, true_phi_n = self.icm(features, next_features, actions)  # 移除 detach
-        inv_loss = F.cross_entropy(logits, actions)
-        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
-        icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
+        logits, predicted_phi_next, true_phi_next = self.icm(features, next_features, actions)  # 移除 detach
+        inverse_loss = F.cross_entropy(logits, actions)
+        forward_loss = F.mse_loss(predicted_phi_next, true_phi_next.detach())
+        icm_loss = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
-            intrinsic_rewards = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+            intrinsic_rewards = ICM_ETA * 0.5 * (predicted_phi_next - true_phi_next).pow(2).sum(dim=1)
             intrinsic_rewards = intrinsic_rewards / (intrinsic_rewards.mean() + 1e-6) * external_rewards.mean()  # 正規化內在獎勵
 
         # DQN targets
-        q_pred = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        a_n = self.online(next_states).argmax(1)
-        q_next = self.target(next_states).gather(1, a_n.unsqueeze(1)).squeeze(1)
+        q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_actions = self.online(next_states).argmax(1)
+        q_next = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
         total_rewards = external_rewards + intrinsic_rewards
-        q_tar = total_rewards + (GAMMA_POW_N_STEP) * q_next * (1 - dones)
-        td = q_pred - q_tar.detach()
-        dqn_loss = (F.smooth_l1_loss(q_pred, q_tar.detach(), reduction='none') * weights).mean()
+        q_target = total_rewards + (GAMMA_POW_N_STEP) * q_next * (1 - dones)
+        td_value = q_predicted - q_target.detach()
+        dqn_loss = (F.smooth_l1_loss(q_predicted, q_target.detach(), reduction='none') * weights).mean()
 
         # update DQN & ICM
         self.optimizer.zero_grad()
@@ -419,13 +410,14 @@ class Agent:
 
         self.online.reset_noise()
         self.target.reset_noise()
-        self.buffer.update_priorities(indices, td.abs().detach().cpu().numpy())  # 使用 abs
+        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())  # 使用 abs
 
-        # sync
         if self.frame_idx % TARGET_UPDATE == 0:
             if TAU == 1.0:
+                # Hard target update
                 self.target.load_state_dict(self.online.state_dict())
             else:
+                # Soft target update
                 for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
                     target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
 
@@ -484,7 +476,7 @@ def plot_figure(agent: Agent, episode: int):
     plt.plot(agent.icm_losses, label='ICM Loss')
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=4.0)
+    plt.ylim(bottom=0.0,top=min(100.0, max(agent.dqn_losses)))
     plt.legend()
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -495,21 +487,21 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth
     agent.online.eval()
     eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
     state = eval_env.reset()
-    e_reward = 0
+    eval_reward = 0
     done = False
     while not done:
         e_action = agent.act(state)
         state, reward, done, _ = eval_env.step(e_action)
-        e_reward += reward
+        eval_reward += reward
     eval_env.close()
-    agent.eval_rewards.append(e_reward)
-    if e_reward > agent.best_eval_reward:
-        agent.best_eval_reward = e_reward
-    tqdm.write(f"Eval Reward: {e_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
+    agent.eval_rewards.append(eval_reward)
+    if eval_reward > agent.best_eval_reward:
+        agent.best_eval_reward = eval_reward
+    tqdm.write(f"Eval Reward: {eval_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
 
-    if e_reward >= 4000 and e_reward == agent.best_eval_reward:
+    if eval_reward >= 4000 and eval_reward == agent.best_eval_reward:
         agent.save_model(best_checkpoint_path)
-        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
+        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {eval_reward:.1f}")
 
 def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
@@ -517,10 +509,10 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
 
-    start_ep = 1
+    start_episode = 1
     if os.path.isfile(checkpoint_path):
         agent.load_model(checkpoint_path)
-        start_ep = len(agent.rewards) + 1
+        start_episode = len(agent.rewards) + 1
 
     agent.online.train()
 
@@ -538,10 +530,10 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
     progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
     progress_bar.update(len(agent.dqn_losses))
 
-    for ep in range(start_ep, num_episodes + 1):
+    for episode in range(start_episode, num_episodes + 1):
         state = env.reset()
         # ep_reward = 0
-        ep_env_reward = 0
+        episode_reward = 0
         # prev_x = None
         prev_life = None
         done = False
@@ -579,34 +571,34 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
             state = next_state
             # ep_reward += custom_reward
-            ep_env_reward += reward
+            episode_reward += reward
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
                 break
 
-        agent.rewards.append(ep_env_reward)
+        agent.rewards.append(episode_reward)
         if not done_flag:
             count_truncated += 1
 
         # Logging
-        if ep % PLOT_INTERVAL == 0:
+        if episode % PLOT_INTERVAL == 0:
             avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {count_truncated}")
+            tqdm.write(f"Episode {episode} | Reward {episode_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {count_truncated}")
             count_truncated = 0
 
         # Evaluation
-        if ep % EVAL_INTERVAL == 0:
-            evaluation(agent, ep, best_checkpoint_path)
+        if episode % EVAL_INTERVAL == 0:
+            evaluation(agent, episode, best_checkpoint_path)
             agent.online.train()
 
         # Plot
-        if ep % PLOT_INTERVAL == 0:
-            plot_figure(agent, ep)
+        if episode % PLOT_INTERVAL == 0:
+            plot_figure(agent, episode)
 
         # Save model
-        if ep % SAVE_INTERVAL == 0:
+        if episode % SAVE_INTERVAL == 0:
             agent.save_model(checkpoint_path)
-            tqdm.write(f"Model saved at episode {ep}")
+            tqdm.write(f"Model saved at episode {episode}")
 
         if agent.frame_idx >= MAX_FRAMES:
             break
