@@ -1,7 +1,5 @@
 import os
-# import time
 import random
-# import pickle
 from collections import deque, namedtuple
 from typing import Dict, List, Tuple
 import cv2
@@ -16,24 +14,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torchvision import transforms as T
+# from torchvision import transforms as T
 from tqdm import tqdm
-# from PIL import Image
 from numba import njit
 
 from segment_tree import SumSegmentTree, MinSegmentTree
 
 Exp = namedtuple('Exp', ['state', 'action', 'reward', 'next_state', 'done'])
 
-# -----------------------------
 # Hyperparameters
-# -----------------------------
 MEMORY_SIZE             = 50000
 BATCH_SIZE              = 64
-GAMMA                   = 0.9
+GAMMA                   = 0.95
 TARGET_UPDATE           = 10000
-NOISY_STD_INIT          = 2.5
-LR                      = 0.000001
+NOISY_STD_INIT          = 1.0
+LR                      = 0.000002
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -52,7 +47,9 @@ BACKWARD_PENALTY        = 0
 STAY_PENALTY            = 0
 DEATH_PENALTY           = -100
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.01
+ICM_ETA_START           = 0.1
+ICM_ETA_MIN             = 0.01
+ICM_ETA_FRAMES          = 1000000
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 EVAL_INTERVAL           = 10
@@ -64,12 +61,14 @@ PLOT_DIR                = "./plots"
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 @njit
-def get_beta_by_frame(frame_idx):
+def get_dynamic_beta(frame_idx):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
-# -----------------------------
-# 1. Environment Wrappers
-# -----------------------------
+@njit
+def get_dynamic_eta(frame_idx):
+    return max(ICM_ETA_MIN, ICM_ETA_START + frame_idx * (ICM_ETA_MIN - ICM_ETA_START) / ICM_ETA_FRAMES)
+
+# Environment Wrappers (保持不變)
 class SkipAndMax(gym.Wrapper):
     def __init__(self, env, skip=4):
         super().__init__(env)
@@ -97,7 +96,6 @@ class SkipAndMax(gym.Wrapper):
 class GrayScaleResizeCrop(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        # old_shape = gym.spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8).shape
         self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
 
     def observation(self, obs):
@@ -106,15 +104,10 @@ class GrayScaleResizeCrop(gym.ObservationWrapper):
     @staticmethod
     def process(frame):
         frame = np.asarray(frame)
-        # assert frame.shape == (240, 256, 3), "Wrong resolution."
-        # 使用 OpenCV 轉灰度
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
-        # 縮放到 (110, 84)，然後裁剪
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
-        frame = frame[18:102, :]  # (84, 84)
-        # 轉為 (1, 84, 84)，規範化到 [0, 1]
+        frame = frame[18:102, :]
         return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
-        # assert frame.shape == (1, 84, 84)
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, n_steps=4):
@@ -147,9 +140,7 @@ def make_env():
     env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
     return env
 
-# -----------------------------
-# 2. Noisy Linear Layer
-# -----------------------------
+# Noisy Linear Layer (保持不變)
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, std_init=NOISY_STD_INIT):
         super().__init__()
@@ -192,43 +183,71 @@ class NoisyLinear(nn.Module):
         x = torch.randn(size)
         return x.sign().mul(x.abs().sqrt())
 
-# -----------------------------
-# 3. Intrinsic Curiosity Module
-# -----------------------------
+# Intrinsic Curiosity Module (ICM) - 改進版
+def _compute_intrinsic_reward(pred_phi_next: torch.Tensor, phi_next: torch.Tensor, eta=0.1):
+    # Compute intrinsic reward based on forward prediction error
+    intrinsic_reward = eta * 0.5 * (pred_phi_next - phi_next).pow(2).sum(dim=1)
+    return intrinsic_reward
+
 class ICM(nn.Module):
-    def __init__(self, feat_dim, n_actions, embed_dim=ICM_EMBED_DIM):
-        super().__init__()
+    def __init__(self, feat_dim=3136, num_actions=12, embed_dim=ICM_EMBED_DIM):
+        """
+        Intrinsic Curiosity Module (ICM) using pre-extracted features from DQN.
+
+        Args:
+            feat_dim (int): Dimension of pre-extracted features from DQN.
+            num_actions (int): Number of actions in the action space.
+            embed_dim (int): Dimension of the embedding space.
+        """
+        super(ICM, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_actions = num_actions
+
+        # Feature encoder: map pre-extracted features to embedding space
         self.encoder = nn.Sequential(
-            nn.Flatten(), nn.Linear(feat_dim, embed_dim), nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim), nn.ReLU()
+            nn.Linear(feat_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU()
         )
-        self.inverse_model = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512), nn.ReLU(),
-            nn.Linear(512, n_actions)
-        )
+
+        # Forward model (predict next state feature)
         self.forward_model = nn.Sequential(
-            nn.Linear(embed_dim + n_actions, 512), nn.ReLU(),
+            nn.Linear(embed_dim + num_actions, 512),
+            nn.ReLU(),
             nn.Linear(512, embed_dim)
         )
 
+        # Inverse model (predict action)
+        self.inverse_model = nn.Sequential(
+            nn.Linear(embed_dim * 2, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_actions)
+        )
+
+    def get_feature(self, x):
+        x = self.encoder(x)
+        # Normalize features to unit L2 norm
+        x = F.normalize(x, p=2, dim=1)
+        return x
+
     def forward(self, feat, next_feat, action):
-        phi = self.encoder(feat)
-        phi_next = self.encoder(next_feat)
+        # Extract features from pre-extracted DQN features
+        phi = self.get_feature(feat)
+        phi_next = self.get_feature(next_feat)
 
-        # Normalize embeddings to unit L2 norm
-        phi = F.normalize(phi, p=2, dim=1)
-        phi_next = F.normalize(phi_next, p=2, dim=1)
-
+        # Inverse prediction: predict action
         inv_in = torch.cat([phi, phi_next], dim=1)
         logits = self.inverse_model(inv_in)
-        a_onehot = F.one_hot(action, logits.size(-1)).float()
+
+        # Forward prediction: predict next state feature
+        a_onehot = F.one_hot(action, self.num_actions).float()
         fwd_in = torch.cat([phi, a_onehot], dim=1)
         pred_phi_next = self.forward_model(fwd_in)
+
         return logits, pred_phi_next, phi_next
 
-# -----------------------------
-# 4. Dueling Distributional Network
-# -----------------------------
+# Dueling Distributional Network (保持不變)
 class DuelingDistNetwork(nn.Module):
     def __init__(self, in_channels: int, n_actions: int, atom_size: int, support: torch.Tensor):
         super().__init__()
@@ -278,9 +297,7 @@ class DuelingDistNetwork(nn.Module):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
             m.reset_noise()
 
-# -----------------------------
-# 5. Prioritized Replay Buffer
-# -----------------------------
+# Prioritized Replay Buffer (保持不變)
 @njit
 def _compute_n_step_return(
     rewards: np.ndarray,
@@ -341,18 +358,10 @@ class PrioritizedReplayBuffer:
         self.size = min(self.size + 1, self.max_size)
 
     def _get_n_step(self):
-        # reward, next_state, done = self.n_step_buffer[-1].reward, self.n_step_buffer[-1].next_state, self.n_step_buffer[-1].done
-        # for trans in reversed(list(self.n_step_buffer)[:-1]):
-        #     reward = trans.reward + GAMMA * reward * (1 - trans.done)
-        #     next_state, done = (trans.next_state, trans.done) if trans.done else (next_state, done)
-        # return reward, next_state, done
-
-        # 提取 n_step_buffer 的資料為 NumPy 陣列
         rewards = np.array([trans.reward for trans in self.n_step_buffer], dtype=np.float32)
         dones = np.array([trans.done for trans in self.n_step_buffer], dtype=np.float32)
         last_next_state = self.n_step_buffer[-1].next_state
         last_done = float(self.n_step_buffer[-1].done)
-        # 用 numba 加速計算
         reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, GAMMA)
         return reward, next_state, done
 
@@ -361,7 +370,7 @@ class PrioritizedReplayBuffer:
             return None
         p_total = self.sum_tree.sum(0, self.size - 1)
         p_min = self.min_tree.min() / p_total if p_total > 0 else 1.0
-        beta = get_beta_by_frame(frame_idx)
+        beta = get_dynamic_beta(frame_idx)
         max_weight = (p_min * self.size) ** (-beta) if p_min > 0 else 1.0
         indices = []
         p_samples = []
@@ -384,16 +393,9 @@ class PrioritizedReplayBuffer:
         return batch, weights, indices
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
-        # priorities = np.maximum(priorities, PRIOR_EPS)
-        # for idx, priority in zip(indices, priorities):
-        #     self.sum_tree[idx] = priority ** ALPHA
-        #     self.min_tree[idx] = priority ** ALPHA
-        #     self.max_priority = max(self.max_priority, priority)
-
         priorities = np.maximum(priorities, PRIOR_EPS)
         priorities_alpha = priorities ** ALPHA
         indices = np.asarray(indices, dtype=np.int32)
-        # 直接調用 segment_tree 中的 batch_update 方法
         self.sum_tree.batch_update(indices, priorities_alpha)
         self.min_tree.batch_update(indices, priorities_alpha)
         self.max_priority = max(self.max_priority, np.max(priorities))
@@ -428,9 +430,7 @@ class PrioritizedReplayBuffer:
         self.tree_ptr = state['tree_ptr']
         self.max_priority = state['max_priority']
 
-# -----------------------------
-# 6. Agent
-# -----------------------------
+# Agent - 改進版
 class Agent:
     def __init__(self, obs_shape: Tuple, n_actions: int, device):
         self.device = device
@@ -441,7 +441,7 @@ class Agent:
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
         self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
-        self.icm = ICM(self.online.feat_dim, n_actions).to(device)
+        self.icm = ICM(feat_dim=self.online.feat_dim, num_actions=n_actions).to(device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
         self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE)
         self.frame_idx = 0
@@ -449,6 +449,7 @@ class Agent:
         self.dqn_losses = []
         self.icm_losses = []
         self.eval_rewards = []
+        self.int_rewards = []  # 記錄內在獎勵
         self.best_eval_reward = -np.inf
 
     def act(self, state):
@@ -462,14 +463,18 @@ class Agent:
         if sample is None:
             return None, None, None
         batch, weights, indices = sample
-        state = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
-        r_ext = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
-        next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
-        done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
-        w = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        state = torch.from_numpy(batch.state).float().to(self.device)
+        action = torch.from_numpy(batch.action).long().to(self.device)
+        r_ext = torch.from_numpy(batch.reward).float().to(self.device)
+        next_state = torch.from_numpy(batch.next_state).float().to(self.device)
+        done = torch.from_numpy(batch.done).float().to(self.device)
+        w = torch.from_numpy(weights).float().to(self.device)
 
-        # Compute distributional loss
+        # Extract features once for both DQN and ICM
+        feat = self.online.get_features(state)
+        next_feat = self.online.get_features(next_state)
+
+        # Compute distributional loss (without intrinsic reward)
         curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
         with torch.no_grad():
             next_action = self.online(next_state).argmax(1)
@@ -487,18 +492,19 @@ class Agent:
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
 
-        # ICM loss
-        feat = self.online.get_features(state)
-        next_feat = self.online.get_features(next_state)
-        logits, pred_phi_n, true_phi_n = self.icm(feat.detach(), next_feat.detach(), action)
+        # ICM loss (use pre-extracted features)
+        logits, pred_phi_n, true_phi_n = self.icm(feat, next_feat, action)
         inv_loss = F.cross_entropy(logits, action)
         fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
         icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
+
+        # Compute intrinsic reward with dynamic eta
+        eta = get_dynamic_eta(self.frame_idx)
         with torch.no_grad():
-            int_r = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+            int_reward = _compute_intrinsic_reward(pred_phi_n, true_phi_n, eta=eta)
 
         # Update DQN with combined reward
-        total_r = r_ext + int_r
+        total_r = r_ext + int_reward
         curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
         with torch.no_grad():
             t_z = total_r.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
@@ -512,16 +518,6 @@ class Agent:
         log_p = torch.log(curr_dist.clamp(min=1e-3))
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
-
-        # Optimize
-        # self.optimizer.zero_grad()
-        # self.icm_optimizer.zero_grad()
-        # (dqn_loss + icm_loss).backward()
-        # torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
-        # self.optimizer.step()
-        # self.icm_optimizer.step()
-        # self.online.reset_noise()
-        # self.target.reset_noise()
 
         # Optimize DQN and ICM separately
         self.optimizer.zero_grad()
@@ -539,7 +535,8 @@ class Agent:
         # Soft target update
         for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
             target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
-        return dqn_loss.item(), icm_loss.item(), int_r.mean().item()
+
+        return dqn_loss.item(), icm_loss.item(), int_reward.mean().item()
 
     def save_model(self, path):
         torch.save({
@@ -553,6 +550,7 @@ class Agent:
             'dqn_losses': self.dqn_losses,
             'icm_losses': self.icm_losses,
             'eval_rewards': self.eval_rewards,
+            'int_rewards': self.int_rewards,
             'best_eval_reward': self.best_eval_reward,
             'buffer_state': self.buffer.get_state(),
         }, path, pickle_protocol=4)
@@ -569,28 +567,38 @@ class Agent:
         self.dqn_losses = checkpoint['dqn_losses']
         self.icm_losses = checkpoint['icm_losses']
         self.eval_rewards = checkpoint.get('eval_rewards', [])
+        self.int_rewards = checkpoint.get('int_rewards', [])
         self.best_eval_reward = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
         if eval_mode:
             self.online.eval()
             self.icm.eval()
 
-# -----------------------------
-# 7. Training Loop
-# -----------------------------
+# Training Loop - 改進版
 def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(20, 5))
-    plt.subplot(121)
+    plt.figure(figsize=(20, 8))
+    plt.subplot(221)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(agent.rewards, label='Reward')
     plt.plot([i * EVAL_INTERVAL for i in range(1, len(agent.eval_rewards) + 1)], agent.eval_rewards, label='Eval Reward')
     plt.legend()
-    plt.subplot(122)
-    plt.title("Loss")
-    plt.plot(agent.icm_losses, label='ICM Loss')
+
+    plt.subplot(222)
+    plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.legend()
+
+    plt.subplot(223)
+    plt.title("ICM Loss")
+    plt.plot(agent.icm_losses, label='ICM Loss')
+    plt.legend()
+
+    plt.subplot(224)
+    plt.title("Intrinsic Reward")
+    plt.plot(agent.int_rewards, label='Intrinsic Reward')
+    plt.legend()
+
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
@@ -655,13 +663,6 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             truncated = info.get('TimeLimit.truncated', False)
             done_flag = done and not truncated
             custom_reward = reward
-            # x_pos = info['x_pos']
-            # if x_pos is not None:
-            #     if prev_x is None:
-            #         prev_x = x_pos
-            #     dx = x_pos - prev_x
-            #     custom_reward += BACKWARD_PENALTY if dx < 0 else STAY_PENALTY if dx == 0 else 0
-            #     prev_x = x_pos
             life = info['life']
             if prev_life is None:
                 prev_life = life
@@ -669,12 +670,12 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 custom_reward += DEATH_PENALTY
                 prev_life = life
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
-            dqn_loss, icm_loss, _ = agent.learn()
+            dqn_loss, icm_loss, int_reward = agent.learn()
             if dqn_loss is not None:
                 agent.dqn_losses.append(dqn_loss)
                 agent.icm_losses.append(icm_loss)
+                agent.int_rewards.append(int_reward)
             state = next_state
-            # ep_reward += custom_reward
             ep_env_reward += reward
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
@@ -686,7 +687,8 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         # Logging
         if ep % PLOT_INTERVAL == 0:
             avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Status {status}")
+            avg_int_r = np.mean(agent.int_rewards[-PLOT_INTERVAL:]) if len(agent.int_rewards) >= PLOT_INTERVAL else np.mean(agent.int_rewards)
+            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Avg Intrinsic Reward {avg_int_r:.4f} | Stage {env.unwrapped._stage} | Status {status}")
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
