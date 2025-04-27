@@ -37,7 +37,7 @@ NOISY_STD_INIT          = 2.5
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
-BATCH_SIZE              = 64
+BATCH_SIZE              = 32
 GAMMA                   = 0.9
 N_STEP                  = 5
 ALPHA                   = 0.6
@@ -54,7 +54,7 @@ DEATH_PENALTY           = -100
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.01
+ICM_ETA                 = 0.1
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 
@@ -558,12 +558,15 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         # prev_x = None
         prev_life = None
         done = False
+        count_truncated = 0
+
         while not done:
             agent.frame_idx += 1
             action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
             done_flag = done and not truncated
+
             custom_reward = reward
             # x_pos = info['x_pos']
             # if x_pos is not None:
@@ -578,12 +581,15 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             elif life < prev_life:
                 custom_reward += DEATH_PENALTY
                 prev_life = life
+
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
+
             dqn_loss, icm_loss, int_reward = agent.learn()
             if dqn_loss is not None:
                 agent.dqn_losses.append(dqn_loss)
                 agent.icm_losses.append(icm_loss)
                 agent.int_rewards.append(int_reward)
+
             state = next_state
             # ep_reward += custom_reward
             ep_env_reward += reward
@@ -592,12 +598,14 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 break
 
         agent.rewards.append(ep_env_reward)
-        status = "TERMINATED" if done_flag else "TRUNCATED"
+        if not done_flag:
+            count_truncated += 1
 
         # Logging
         if ep % PLOT_INTERVAL == 0:
             avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Status {status}")
+            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {count_truncated}")
+            count_truncated = 0
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
