@@ -1,151 +1,72 @@
 import os
-import random
 from collections import deque, namedtuple
 from typing import Dict, List, Tuple
-import cv2
-import gym
-from gym.wrappers import TimeLimit
-from nes_py.wrappers import JoypadSpace
-import gym_super_mario_bros
-from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-# from torchvision import transforms as T
 from tqdm import tqdm
 from numba import njit
 
-from segment_tree import SumSegmentTree, MinSegmentTree
+from env_wrapper import make_env
+from segment_tree import SumSegmentTree, MinSegmentTree, _sample_core
 
 Exp = namedtuple('Exp', ['state', 'action', 'reward', 'next_state', 'done'])
 
 # -----------------------------
 # Hyperparameters
 # -----------------------------
-MEMORY_SIZE             = 50000
-BATCH_SIZE              = 64
-GAMMA                   = 0.95
-TARGET_UPDATE           = 10000
-NOISY_STD_INIT          = 2.5
-LR                      = 0.00025
+# Env Wrappers
+SKIP_FRAMES             = 4
+STACK_FRAMES            = 4
+MAX_EPISODE_STEPS       = 3000
+
+# Agent
+TARGET_UPDATE           = 5000
+TAU                     = 1.0
+LEARNING_RATE           = 0.00025
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
 ATOM_SIZE               = 51
+
+# Noisy Linear Layer
+NOISY_STD_INIT          = 2.5
+
+# Prioritized Replay Buffer
+MEMORY_SIZE             = 50000
+BATCH_SIZE              = 64
+GAMMA                   = 0.9
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
-BETA_FRAMES             = 1000000
+BETA_FRAMES             = 2000000
+MAX_FRAMES              = 2000000
 PRIOR_EPS               = 1e-6
-TAU                     = 0.95
-SKIP_FRAMES             = 4
-STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = 3000
-MAX_FRAMES              = 1000000
+GAMMA_POW_N_STEP = GAMMA ** N_STEP
+
+# Customized Reward
 BACKWARD_PENALTY        = 0
 STAY_PENALTY            = 0
 DEATH_PENALTY           = -100
+
+# Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 0.05
+ICM_ETA                 = 0.01
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
+
+# Output
 EVAL_INTERVAL           = 10
 SAVE_INTERVAL           = 100
 PLOT_INTERVAL           = 10
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
-GAMMA_POW_N_STEP = GAMMA ** N_STEP
-
-@njit
-def get_beta_by_frame(frame_idx):
-    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
-
 # -----------------------------
-# 1. Environment Wrappers
-# -----------------------------
-class SkipAndMax(gym.Wrapper):
-    def __init__(self, env, skip=4):
-        super().__init__(env)
-        self._skip = skip
-        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
-
-    def step(self, action):
-        total_reward = 0
-        done = None
-        for i in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
-            self._obs_buffer[i & 1] = np.asarray(obs)
-            total_reward += reward
-            if done:
-                break
-        max_frame = np.max(self._obs_buffer, axis=0)
-        return max_frame, total_reward, done, info
-
-    def reset(self):
-        obs = self.env.reset()
-        obs = np.asarray(obs)
-        self._obs_buffer[0] = self._obs_buffer[1] = obs
-        return obs
-
-class FrameProcessing(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        # old_shape = gym.spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8).shape
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
-
-    def observation(self, obs):
-        return FrameProcessing.process(obs)
-
-    @staticmethod
-    def process(frame):
-        frame = np.asarray(frame)
-        # assert frame.shape == (240, 256, 3), "Wrong resolution."
-        # 使用 OpenCV 轉灰度
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
-        # 縮放到 (110, 84)，然後裁剪
-        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
-        frame = frame[18:102, :]  # (84, 84)
-        # 轉為 (1, 84, 84)，規範化到 [0.0, 1.0]
-        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
-        # assert frame.shape == (1, 84, 84)
-
-class FrameStack(gym.Wrapper):
-    def __init__(self, env, n_steps=4):
-        super().__init__(env)
-        self.n_steps = n_steps
-        shp = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(0, 1, shape=(shp[0] * n_steps, shp[1], shp[2]), dtype=np.float32)
-        self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
-
-    def reset(self):
-        obs = self.env.reset()
-        obs = np.asarray(obs)
-        for i in range(self.n_steps):
-            self.frames[i] = obs
-        return self.frames
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        obs = np.asarray(obs)
-        self.frames[:-1] = self.frames[1:]
-        self.frames[-1] = obs
-        return self.frames, reward, done, info
-
-def make_env():
-    env = gym_super_mario_bros.make('SuperMarioBros-v0')
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = SkipAndMax(env, skip=SKIP_FRAMES)
-    env = FrameProcessing(env)
-    env = FrameStack(env, n_steps=STACK_FRAMES)
-    env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
-    return env
-
-# -----------------------------
-# 2. Noisy Linear Layer
+# Noisy Linear Layer
 # -----------------------------
 class NoisyLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, std_init=NOISY_STD_INIT):
@@ -190,7 +111,7 @@ class NoisyLinear(nn.Module):
         return x.sign().mul(x.abs().sqrt())
 
 # -----------------------------
-# 3. Intrinsic Curiosity Module
+# Intrinsic Curiosity Module
 # -----------------------------
 class ICM(nn.Module):
     def __init__(self, feat_dim, n_actions, embed_dim=ICM_EMBED_DIM):
@@ -216,11 +137,6 @@ class ICM(nn.Module):
     def forward(self, feat, next_feat, action):
         phi = self.encoder(feat)
         phi_next = self.encoder(next_feat)
-
-        # Normalize embeddings to unit L2 norm
-        phi = F.normalize(phi, p=2, dim=1)
-        phi_next = F.normalize(phi_next, p=2, dim=1)
-
         inv_in = torch.cat([phi, phi_next], dim=1)
         logits = self.inverse_model(inv_in)
         a_onehot = F.one_hot(action, logits.size(-1)).float()
@@ -229,7 +145,7 @@ class ICM(nn.Module):
         return logits, pred_phi_next, phi_next
 
 # -----------------------------
-# 4. Dueling Distributional Network
+# Dueling Distributional Network
 # -----------------------------
 class DuelingDistNetwork(nn.Module):
     def __init__(self, in_channels: int, n_actions: int, atom_size: int, support: torch.Tensor):
@@ -286,7 +202,7 @@ class DuelingDistNetwork(nn.Module):
         self.value_layer.reset_noise()
 
 # -----------------------------
-# 5. Prioritized Replay Buffer
+# Prioritized Replay Buffer
 # -----------------------------
 @njit
 def _compute_n_step_return(
@@ -309,9 +225,8 @@ def _compute_n_step_return(
     return reward, next_state, done
 
 @njit
-def _compute_weights(p_samples: np.ndarray, size: int, beta: float, max_weight: float) -> np.ndarray:
-    weights = (p_samples * size) ** (-beta)
-    return weights / max_weight
+def _get_beta_by_frame(frame_idx):
+    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 class PrioritizedReplayBuffer:
     def __init__(self, obs_shape, size, batch_size):
@@ -357,24 +272,17 @@ class PrioritizedReplayBuffer:
         reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, GAMMA)
         return reward, next_state, done
 
-    def sample(self, frame_idx):
+    def sample(self, frame_idx: int):
         if self.size < self.batch_size:
             return None
-        p_total = self.sum_tree.sum(0, self.size - 1)
-        p_min = self.min_tree.min() / p_total if p_total > 0 else 1.0
-        beta = get_beta_by_frame(frame_idx)
-        max_weight = (p_min * self.size) ** (-beta) if p_min > 0 else 1.0
-        indices = []
-        p_samples = []
-        for _ in range(self.batch_size):
-            mass = random.uniform(0, p_total)
-            idx = self.sum_tree.retrieve(mass)
-            indices.append(idx)
-            p_sample = self.sum_tree[idx] / p_total
-            p_samples.append(p_sample)
-        indices = np.array(indices)
-        p_samples = np.array(p_samples)
-        weights = _compute_weights(p_samples, self.size, beta, max_weight)
+        indices, weights = _sample_core(
+            sum_tree=self.sum_tree.tree,
+            min_tree=self.min_tree.tree,
+            size=self.size,
+            batch_size=self.batch_size,
+            beta=_get_beta_by_frame(frame_idx),
+            capacity=self.sum_tree.capacity
+        )
         batch = Exp(
             state=self.obs_buf[indices],
             action=self.acts_buf[indices],
@@ -424,7 +332,7 @@ class PrioritizedReplayBuffer:
         self.max_priority = state['max_priority']
 
 # -----------------------------
-# 6. Agent
+# Agent
 # -----------------------------
 class Agent:
     def __init__(self, obs_shape: Tuple, n_actions: int, device=None):
@@ -439,7 +347,7 @@ class Agent:
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
-        self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
+        self.optimizer = optim.Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
         self.icm = ICM(self.online.feat_dim, n_actions).to(self.device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
@@ -517,31 +425,25 @@ class Agent:
         dqn_loss = (elementwise_loss * w).mean()
 
         # Optimize
-        # self.optimizer.zero_grad()
-        # self.icm_optimizer.zero_grad()
-        # (dqn_loss + icm_loss).backward()
-        # torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
-        # self.optimizer.step()
-        # self.icm_optimizer.step()
-
-        # Optimize DQN and ICM separately
         self.optimizer.zero_grad()
-        dqn_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
-        self.optimizer.step()
-
         self.icm_optimizer.zero_grad()
-        icm_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
+        (dqn_loss + icm_loss).backward()
+        torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
+        self.optimizer.step()
         self.icm_optimizer.step()
 
         self.online.reset_noise()
         self.target.reset_noise()
         self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
 
-        # Soft target update
-        for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
-            target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
+        if self.frame_idx % TARGET_UPDATE == 0:
+            if TAU == 1.0:
+                # Hard target update
+                self.target.load_state_dict(self.online.state_dict())
+            else:
+                # Soft target update
+                for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
+                    target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
 
         return dqn_loss.item(), icm_loss.item(), int_r.mean().item()
 
@@ -582,7 +484,7 @@ class Agent:
             self.icm.eval()
 
 # -----------------------------
-# 7. Training Loop
+# Training Loop
 # -----------------------------
 def plot_figure(agent: Agent, episode: int):
     plt.figure(figsize=(16, 5))
@@ -604,7 +506,7 @@ def plot_figure(agent: Agent, episode: int):
 
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
     agent.online.eval()
-    eval_env = make_env()
+    eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
     state = eval_env.reset()
     e_reward = 0
     done = False
@@ -623,7 +525,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth
         tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
 
 def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
-    env = make_env()
+    env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
     agent = Agent(env.observation_space.shape, env.action_space.n)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
