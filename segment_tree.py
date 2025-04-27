@@ -1,28 +1,27 @@
 # -*- coding: utf-8 -*-
-"""Segment tree for Prioritized Replay Buffer, optimized with Numba."""
 """
-  Original code is from OpenAI baselines github repository:
-  https://github.com/openai/baselines/blob/master/baselines/common/segment_tree.py
+    Segment tree for Prioritized Replay Buffer, optimized with Numba.
+    Original code is from OpenAI baselines github repository:
+    https://github.com/openai/baselines/blob/master/baselines/common/segment_tree.py
 """
 
 import numpy as np
 from numba import njit
-from typing import Callable
 
 @njit
 def _operate_helper_sum(tree: np.ndarray, start: int, end: int, node: int, node_start: int, node_end: int) -> float:
     """Helper function for sum operation, optimized with Numba."""
     if start == node_start and end == node_end:
         return tree[node]
-    mid = (node_start + node_end) // 2
+    mid = (node_start + node_end) >> 1 # // 2
     if end <= mid:
-        return _operate_helper_sum(tree, start, end, 2 * node, node_start, mid)
+        return _operate_helper_sum(tree, start, end, node << 1, node_start, mid) # 2 * node
     else:
         if mid + 1 <= start:
-            return _operate_helper_sum(tree, start, end, 2 * node + 1, mid + 1, node_end)
+            return _operate_helper_sum(tree, start, end, (node << 1) + 1, mid + 1, node_end) # 2 * node + 1
         else:
-            left = _operate_helper_sum(tree, start, mid, 2 * node, node_start, mid)
-            right = _operate_helper_sum(tree, mid + 1, end, 2 * node + 1, mid + 1, node_end)
+            left = _operate_helper_sum(tree, start, mid, node << 1, node_start, mid) # 2 * node
+            right = _operate_helper_sum(tree, mid + 1, end, (node << 1) + 1, mid + 1, node_end) # 2 * node + 1
             return left + right
 
 @njit
@@ -30,15 +29,15 @@ def _operate_helper_min(tree: np.ndarray, start: int, end: int, node: int, node_
     """Helper function for min operation, optimized with Numba."""
     if start == node_start and end == node_end:
         return tree[node]
-    mid = (node_start + node_end) // 2
+    mid = (node_start + node_end) >> 1 # // 2
     if end <= mid:
-        return _operate_helper_min(tree, start, end, 2 * node, node_start, mid)
+        return _operate_helper_min(tree, start, end, node << 1, node_start, mid) # 2 * node
     else:
         if mid + 1 <= start:
-            return _operate_helper_min(tree, start, end, 2 * node + 1, mid + 1, node_end)
+            return _operate_helper_min(tree, start, end, (node << 1) + 1, mid + 1, node_end) # 2 * node + 1
         else:
-            left = _operate_helper_min(tree, start, mid, 2 * node, node_start, mid)
-            right = _operate_helper_min(tree, mid + 1, end, 2 * node + 1, mid + 1, node_end)
+            left = _operate_helper_min(tree, start, mid, node << 1, node_start, mid) # 2 * node
+            right = _operate_helper_min(tree, mid + 1, end, (node << 1) + 1, mid + 1, node_end) # 2 * node + 1
             return min(left, right)
 
 @njit
@@ -46,30 +45,30 @@ def _update_tree_sum(tree: np.ndarray, idx: int, val: float, capacity: int):
     """Update the tree for sum operation, optimized with Numba."""
     idx += capacity
     tree[idx] = val
-    idx //= 2
+    idx >>= 1 # //= 2
     while idx >= 1:
-        tree[idx] = tree[2 * idx] + tree[2 * idx + 1]
-        idx //= 2
+        tree[idx] = tree[idx << 1] + tree[(idx << 1) + 1] # 2 * idx, 2 * idx + 1
+        idx >>= 1 # //= 2
 
 @njit
 def _update_tree_min(tree: np.ndarray, idx: int, val: float, capacity: int):
     """Update the tree for min operation, optimized with Numba."""
     idx += capacity
     tree[idx] = val
-    idx //= 2
+    idx >>= 1 # //= 2
     while idx >= 1:
-        tree[idx] = min(tree[2 * idx], tree[2 * idx + 1])
-        idx //= 2
+        tree[idx] = min(tree[idx << 1], tree[(idx << 1) + 1]) # 2 * idx, 2 * idx + 1
+        idx >>= 1 # //= 2
 
 @njit
 def _retrieve_sum(tree: np.ndarray, upperbound: float, capacity: int) -> int:
     """Retrieve the index for sum tree, optimized with Numba."""
     idx = 1
     while idx < capacity:  # while non-leaf
-        left = 2 * idx
+        left = idx << 1  # 2 * idx
         right = left + 1
         if tree[left] > upperbound:
-            idx = 2 * idx
+            idx <<= 1 # *= 2
         else:
             upperbound -= tree[left]
             idx = right
@@ -80,26 +79,24 @@ def _batch_update_tree_sum(tree: np.ndarray, indices: np.ndarray, values: np.nda
     for i in range(len(indices)):
         idx = indices[i] + capacity
         tree[idx] = values[i]
-        idx //= 2
+        idx >>= 1 # //= 2
         while idx >= 1:
-            tree[idx] = tree[2 * idx] + tree[2 * idx + 1]
-            idx //= 2
+            tree[idx] = tree[idx << 1] + tree[(idx << 1) + 1] # 2 * idx, 2 * idx + 1
+            idx >>= 1 # //= 2
 
 @njit
 def _batch_update_tree_min(tree: np.ndarray, indices: np.ndarray, values: np.ndarray, capacity: int):
     for i in range(len(indices)):
         idx = indices[i] + capacity
         tree[idx] = values[i]
-        idx //= 2
+        idx >>= 1 # //= 2
         while idx >= 1:
-            left = tree[2 * idx]
-            right = tree[2 * idx + 1]
-            tree[idx] = left if left < right else right
-            idx //= 2
+            tree[idx] = min(tree[idx << 1], tree[(idx << 1) + 1]) # 2 * idx, 2 * idx + 1
+            idx >>= 1 # //= 2
 
 class SegmentTree:
     """Base SegmentTree class with Numba optimization."""
-    def __init__(self, capacity: int, operation: Callable, init_value: float):
+    def __init__(self, capacity: int, operation: str, init_value: float):
         assert (
             capacity > 0 and capacity & (capacity - 1) == 0
         ), "capacity must be positive and a power of 2."
