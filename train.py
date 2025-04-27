@@ -134,9 +134,9 @@ class ICM(nn.Module):
             nn.Linear(512, embed_dim)
         )
 
-    def forward(self, feat, next_feat, action):
-        phi = self.encoder(feat)
-        phi_next = self.encoder(next_feat)
+    def forward(self, features, next_features, action):
+        phi = self.encoder(features)
+        phi_next = self.encoder(next_features)
         inv_in = torch.cat([phi, phi_next], dim=1)
         logits = self.inverse_model(inv_in)
         a_onehot = F.one_hot(action, logits.size(-1)).float()
@@ -358,7 +358,7 @@ class Agent:
         self.dqn_losses = []
         self.icm_losses = []
         self.eval_rewards = []
-        self.int_rewards = []
+        self.intrinsic_rewards = []
         self.best_eval_reward = -np.inf
 
     def act(self, state):
@@ -376,90 +376,52 @@ class Agent:
     #         q = self.online(s_t)
     #     return int(q.argmax(1).item())
 
-    def compute_dqn_loss(self, batch, weights, int_r):
-        state = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
-        reward = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
-        next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
-        done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
+    def learn(self):
+        batch, weights, indices = self.buffer.sample(self.frame_idx)
+        states = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
+        actions = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
+        external_rewards = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
+        next_states = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
         weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
 
-        reward += int_r
+        # features
+        features = self.online.get_features(states)
+        next_features = self.online.get_features(next_states)
 
-        curr_dist = self.online.dist(state)
-        curr_dist = curr_dist[range(BATCH_SIZE), action]
-
-        with torch.no_grad():
-            next_action = self.online(next_state).argmax(1)
-            next_dist = self.target.dist(next_state)
-            next_dist = next_dist[range(BATCH_SIZE), next_action]
-
-            t_z = reward.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA_POW_N_STEP) * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-
-            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long() \
-                .unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
-
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(
-                0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
-            )
-            proj_dist.view(-1).index_add_(
-                0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
-            )
-
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        loss = (weights * elementwise_loss).mean()
-        return loss, elementwise_loss
-
-    def learn(self):
-        sample = self.buffer.sample(self.frame_idx)
-        if sample is None:
-            return None, None, None
-        batch, weights, indices = sample
-        state = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
-        action = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
-        r_ext = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
-        next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
-        # done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
-        # w = torch.tensor(weights, dtype=torch.float32, device=self.device)
-
-        # ICM loss
-        feat = self.online.get_features(state)
-        next_feat = self.online.get_features(next_state)
-        logits, pred_phi_n, true_phi_n = self.icm(feat, next_feat, action)
-        inv_loss = F.cross_entropy(logits, action)
-        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n)
+        # ICM forward
+        logits, pred_phi_n, true_phi_n = self.icm(features, next_features, actions)  # 移除 detach
+        inv_loss = F.cross_entropy(logits, actions)
+        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
         icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
         with torch.no_grad():
-            int_r = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
-            int_r = int_r / (int_r.mean() + 1e-6) * r_ext.mean()  # 正規化
+            intrinsic_rewards = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+            intrinsic_rewards = intrinsic_rewards / (intrinsic_rewards.mean() + 1e-6) * external_rewards.mean()  # 正規化內在獎勵
 
-        # Compute distributional loss with combined reward
-        dqn_loss, elementwise_loss = self.compute_dqn_loss(batch, weights, int_r)
+        # DQN targets
+        q_pred = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        a_n = self.online(next_states).argmax(1)
+        q_next = self.target(next_states).gather(1, a_n.unsqueeze(1)).squeeze(1)
+        total_rewards = external_rewards + intrinsic_rewards
+        q_tar = total_rewards + (GAMMA_POW_N_STEP) * q_next * (1 - dones)
+        td = q_pred - q_tar.detach()
+        dqn_loss = (F.smooth_l1_loss(q_pred, q_tar.detach(), reduction='none') * weights).mean()
 
-        # Optimize DQN and ICM separately
+        # update DQN & ICM
         self.optimizer.zero_grad()
-        dqn_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
-        self.optimizer.step()
-
         self.icm_optimizer.zero_grad()
+        dqn_loss.backward()
         icm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
         torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
+        self.optimizer.step()
         self.icm_optimizer.step()
 
         self.online.reset_noise()
         self.target.reset_noise()
+        self.buffer.update_priorities(indices, td.abs().detach().cpu().numpy())  # 使用 abs
 
-        priorities = elementwise_loss.abs().detach().cpu().numpy()
-        priorities = priorities / (priorities.mean() + 1e-6)  # 正規化
-        self.buffer.update_priorities(indices, priorities)
-
+        # sync
         if self.frame_idx % TARGET_UPDATE == 0:
             if TAU == 1.0:
                 self.target.load_state_dict(self.online.state_dict())
@@ -467,7 +429,7 @@ class Agent:
                 for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
                     target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
 
-        return dqn_loss.item(), icm_loss.item(), int_r.mean().item()
+        return dqn_loss.item(), icm_loss.item(), intrinsic_rewards.mean().item()  # 返回損失值和內在獎勵
 
     def save_model(self, path):
         torch.save({
@@ -481,7 +443,7 @@ class Agent:
             'dqn_losses': self.dqn_losses,
             'icm_losses': self.icm_losses,
             'eval_rewards': self.eval_rewards,
-            'int_rewards': self.int_rewards,
+            'intrinsic_rewards': self.intrinsic_rewards,
             'best_eval_reward': self.best_eval_reward,
             'buffer_state': self.buffer.get_state(),
         }, path, pickle_protocol=4)
@@ -498,7 +460,7 @@ class Agent:
         self.dqn_losses = checkpoint['dqn_losses']
         self.icm_losses = checkpoint['icm_losses']
         self.eval_rewards = checkpoint.get('eval_rewards', [])
-        self.int_rewards = checkpoint.get('int_rewards', [])
+        self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
         self.best_eval_reward = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
         if eval_mode:
@@ -515,11 +477,14 @@ def plot_figure(agent: Agent, episode: int):
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(agent.rewards, label='Reward')
     plt.plot([i * EVAL_INTERVAL for i in range(1, len(agent.eval_rewards) + 1)], agent.eval_rewards, label='Eval Reward')
+    plt.xlim(left=0.0, right=len(agent.rewards))
     plt.legend()
     plt.subplot(122)
     plt.title("Loss")
     plt.plot(agent.icm_losses, label='ICM Loss')
     plt.plot(agent.dqn_losses, label='DQN Loss')
+    plt.xlim(left=0.0, right=len(agent.dqn_losses))
+    plt.ylim(bottom=0.0,top=4.0)
     plt.legend()
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -610,7 +575,7 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             if dqn_loss is not None:
                 agent.dqn_losses.append(dqn_loss)
                 agent.icm_losses.append(icm_loss)
-                agent.int_rewards.append(int_reward)
+                agent.intrinsic_rewards.append(int_reward)
 
             state = next_state
             # ep_reward += custom_reward
