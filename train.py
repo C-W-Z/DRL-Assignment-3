@@ -237,48 +237,53 @@ class DuelingDistNetwork(nn.Module):
         self.support = support
         self.n_actions = n_actions
         self.atom_size = atom_size
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
+
+        self.feature_layer = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
             nn.Flatten()
         )
+
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, 84, 84)
-            feat_dim = self.features(dummy).shape[1]
-        self.value_noisy = NoisyLinear(feat_dim, 512)
-        self.value = NoisyLinear(512, atom_size)
-        self.adv_noisy = NoisyLinear(feat_dim, 512)
-        self.adv = NoisyLinear(512, n_actions * atom_size)
-        self.feat_dim = feat_dim
+            self.feat_dim = self.feature_layer(dummy).shape[1]
+
+        self.advantage_hidden_layer = NoisyLinear(self.feat_dim, 512)
+        self.advantage_layer = NoisyLinear(512, n_actions * atom_size)
+        self.value_hidden_layer = NoisyLinear(self.feat_dim, 512)
+        self.value_layer = NoisyLinear(512, atom_size)
+
+    def get_features(self, x):
+        return self.feature_layer(x / 255.0)
 
     def forward(self, x):
-        x = self.get_features(x)
-        value = F.relu(self.value_noisy(x))
-        value = self.value(value).view(-1, 1, self.atom_size)
-        adv = F.relu(self.adv_noisy(x))
-        adv = self.adv(adv).view(-1, self.n_actions, self.atom_size)
-        q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
-        dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
-        q = (dist * self.support).sum(dim=2)
+        dist = self.dist(x)
+        q = torch.sum(dist * self.support, dim=2)
         return q
 
     def dist(self, x):
         x = self.get_features(x)
-        value = F.relu(self.value_noisy(x))
-        value = self.value(value).view(-1, 1, self.atom_size)
-        adv = F.relu(self.adv_noisy(x))
-        adv = self.adv(adv).view(-1, self.n_actions, self.atom_size)
-        q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
-        dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
+
+        advantage = F.relu(self.advantage_hidden_layer(x))
+        advantage = self.advantage_layer(advantage).view(-1, self.n_actions, self.atom_size)
+
+        value = F.relu(self.value_hidden_layer(x))
+        value = self.value_layer(value).view(-1, 1, self.atom_size)
+
+        q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
+        dist = F.softmax(q_atoms, dim=-1)
+        dist = dist.clamp(min=1e-3)
         return dist
 
-    def get_features(self, x):
-        return self.features(x)
-
     def reset_noise(self):
-        for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
-            m.reset_noise()
+        self.advantage_hidden_layer.reset_noise()
+        self.advantage_layer.reset_noise()
+        self.value_hidden_layer.reset_noise()
+        self.value_layer.reset_noise()
 
 # -----------------------------
 # 5. Prioritized Replay Buffer
@@ -426,17 +431,17 @@ class Agent:
         self.device = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.n_actions = n_actions
 
-        self.support = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(device)
+        self.support = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(self.device)
 
-        self.online = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(device)
+        self.online = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(self.device)
 
-        self.target = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(device)
+        self.target = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
         self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
 
-        self.icm = ICM(self.online.feat_dim, n_actions).to(device)
+        self.icm = ICM(self.online.feat_dim, n_actions).to(self.device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
 
         self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE)
