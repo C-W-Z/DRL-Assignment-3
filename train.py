@@ -4,7 +4,7 @@ import random
 # import pickle
 from collections import deque, namedtuple
 from typing import Dict, List, Tuple
-
+import cv2
 import gym
 import gym_super_mario_bros
 from nes_py.wrappers import JoypadSpace
@@ -30,10 +30,10 @@ Exp = namedtuple('Exp', ['state', 'action', 'reward', 'next_state', 'done'])
 # -----------------------------
 MEMORY_SIZE             = 50000
 BATCH_SIZE              = 64
-GAMMA                   = 0.99
+GAMMA                   = 0.9
 TARGET_UPDATE           = 10000
-NOISY_STD_INIT          = 0.5
-LR                      = 0.0001
+NOISY_STD_INIT          = 2.5
+LR                      = 0.00025
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -41,7 +41,7 @@ ATOM_SIZE               = 51
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
-BETA_FRAMES             = 2000000
+BETA_FRAMES             = 1000000
 PRIOR_EPS               = 1e-6
 TAU                     = 0.9
 SKIP_FRAMES             = 4
@@ -62,6 +62,10 @@ MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
+
+@njit
+def get_beta_by_frame(frame_idx):
+    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 # -----------------------------
 # 1. Environment Wrappers
@@ -90,19 +94,27 @@ class SkipAndMax(gym.Wrapper):
         self._obs_buffer[0] = self._obs_buffer[1] = obs
         return obs
 
-class GrayScaleResize(gym.ObservationWrapper):
+class GrayScaleResizeCrop(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Grayscale(),
-            T.Resize((84, 84)),
-            T.ToTensor() # scaled to [0.0, 1.0]
-        ])
-        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 84), dtype=np.float32)
+        # old_shape = gym.spaces.Box(low=0, high=255, shape=(84, 84, 1), dtype=np.uint8).shape
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
 
     def observation(self, obs):
-        return self.transform(obs)
+        return GrayScaleResizeCrop.process(obs)
+
+    @staticmethod
+    def process(frame):
+        frame = np.asarray(frame)
+        # assert frame.shape == (240, 256, 3), "Wrong resolution."
+        # 使用 OpenCV 轉灰度
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
+        # 縮放到 (110, 84)，然後裁剪
+        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
+        frame = frame[18:102, :]  # (84, 84)
+        # 轉為 (1, 84, 84)，規範化到 [0, 1]
+        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
+        # assert frame.shape == (1, 84, 84)
 
 class FrameStack(gym.Wrapper):
     def __init__(self, env, n_steps=4):
@@ -130,7 +142,7 @@ def make_env():
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = SkipAndMax(env, skip=SKIP_FRAMES)
-    env = GrayScaleResize(env)
+    env = GrayScaleResizeCrop(env)
     env = FrameStack(env, n_steps=STACK_FRAMES)
     env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
     return env
@@ -144,12 +156,12 @@ class NoisyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.std_init = std_init
-        self.weight_mu = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.Tensor(out_features, in_features))
-        self.register_buffer("weight_epsilon", torch.Tensor(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.Tensor(out_features))
-        self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
-        self.register_buffer("bias_epsilon", torch.Tensor(out_features))
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
         self.reset_parameters()
         self.reset_noise()
 
@@ -163,7 +175,7 @@ class NoisyLinear(nn.Module):
     def reset_noise(self):
         epsilon_in = self.scale_noise(self.in_features)
         epsilon_out = self.scale_noise(self.out_features)
-        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
         self.bias_epsilon.copy_(epsilon_out)
 
     def forward(self, x):
@@ -178,7 +190,7 @@ class NoisyLinear(nn.Module):
     @staticmethod
     def scale_noise(size):
         x = torch.randn(size)
-        return x.sign() * x.abs().sqrt()
+        return x.sign().mul(x.abs().sqrt())
 
 # -----------------------------
 # 3. Intrinsic Curiosity Module
@@ -213,7 +225,7 @@ class ICM(nn.Module):
 # 4. Dueling Distributional Network
 # -----------------------------
 class DuelingDistNetwork(nn.Module):
-    def __init__(self, in_channels, n_actions, atom_size, support):
+    def __init__(self, in_channels: int, n_actions: int, atom_size: int, support: torch.Tensor):
         super().__init__()
         self.support = support
         self.n_actions = n_actions
@@ -255,7 +267,7 @@ class DuelingDistNetwork(nn.Module):
         return dist
 
     def get_features(self, x):
-        return self.features(x)
+        return self.features(x / 255.0)
 
     def reset_noise(self):
         for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
@@ -290,11 +302,9 @@ def _compute_weights(p_samples: np.ndarray, size: int, beta: float, max_weight: 
     return weights / max_weight
 
 class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape, size, batch_size, alpha, beta_start, beta_frames):
+    def __init__(self, obs_shape, size, batch_size):
         self.obs_shape = obs_shape
         self.max_size, self.batch_size = size, batch_size
-        self.alpha, self.beta_start, self.beta_frames = alpha, beta_start, beta_frames
-        self.beta_by_frame = lambda f: min(1.0, beta_start + f * (1.0 - beta_start) / beta_frames)
         self.obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.next_obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.acts_buf = np.zeros([size], dtype=np.int64)
@@ -319,8 +329,8 @@ class PrioritizedReplayBuffer:
         self.rews_buf[self.ptr] = reward_n
         self.next_obs_buf[self.ptr] = next_state_n
         self.done_buf[self.ptr] = done_n
-        self.sum_tree[self.tree_ptr] = self.max_priority ** self.alpha
-        self.min_tree[self.tree_ptr] = self.max_priority ** self.alpha
+        self.sum_tree[self.tree_ptr] = self.max_priority ** ALPHA
+        self.min_tree[self.tree_ptr] = self.max_priority ** ALPHA
         self.tree_ptr = (self.tree_ptr + 1) % self.max_size
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
@@ -346,7 +356,7 @@ class PrioritizedReplayBuffer:
             return None
         p_total = self.sum_tree.sum(0, self.size - 1)
         p_min = self.min_tree.min() / p_total if p_total > 0 else 1.0
-        beta = self.beta_by_frame(frame_idx)
+        beta = get_beta_by_frame(frame_idx)
         max_weight = (p_min * self.size) ** (-beta) if p_min > 0 else 1.0
         indices = []
         p_samples = []
@@ -371,12 +381,12 @@ class PrioritizedReplayBuffer:
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
         # priorities = np.maximum(priorities, PRIOR_EPS)
         # for idx, priority in zip(indices, priorities):
-        #     self.sum_tree[idx] = priority ** self.alpha
-        #     self.min_tree[idx] = priority ** self.alpha
+        #     self.sum_tree[idx] = priority ** ALPHA
+        #     self.min_tree[idx] = priority ** ALPHA
         #     self.max_priority = max(self.max_priority, priority)
 
         priorities = np.maximum(priorities, PRIOR_EPS)
-        priorities_alpha = priorities ** self.alpha
+        priorities_alpha = priorities ** ALPHA
         indices = np.asarray(indices, dtype=np.int32)
         # 直接調用 segment_tree 中的 batch_update 方法
         self.sum_tree.batch_update(indices, priorities_alpha)
@@ -417,7 +427,7 @@ class PrioritizedReplayBuffer:
 # 6. Agent
 # -----------------------------
 class Agent:
-    def __init__(self, obs_shape, n_actions, device):
+    def __init__(self, obs_shape: Tuple, n_actions: int, device):
         self.device = device
         self.n_actions = n_actions
         self.support = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(device)
@@ -428,12 +438,13 @@ class Agent:
         self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
         self.icm = ICM(self.online.feat_dim, n_actions).to(device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, BETA_START, BETA_FRAMES)
+        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE)
         self.frame_idx = 0
         self.rewards = []
-        self.losses = []
-        self.eval_rewards = []  # 新增：存儲所有評估獎勵
-        self.best_eval_reward = -np.inf  # 新增：追蹤最佳評估獎勵
+        self.dqn_losses = []
+        self.icm_losses = []
+        self.eval_rewards = []
+        self.best_eval_reward = -np.inf
 
     def act(self, state):
         s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -452,6 +463,7 @@ class Agent:
         next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
         done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
         w = torch.tensor(weights, dtype=torch.float32, device=self.device)
+
         # Compute distributional loss
         curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
         with torch.no_grad():
@@ -469,6 +481,7 @@ class Agent:
         log_p = torch.log(curr_dist.clamp(min=1e-3))
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
+
         # ICM loss
         feat = self.online.get_features(state)
         next_feat = self.online.get_features(next_state)
@@ -478,6 +491,7 @@ class Agent:
         icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
         with torch.no_grad():
             int_r = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+
         # Update DQN with combined reward
         total_r = r_ext + int_r
         curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
@@ -493,6 +507,7 @@ class Agent:
         log_p = torch.log(curr_dist.clamp(min=1e-3))
         elementwise_loss = -(proj_dist * log_p).sum(1)
         dqn_loss = (elementwise_loss * w).mean()
+
         # Optimize
         self.optimizer.zero_grad()
         self.icm_optimizer.zero_grad()
@@ -503,6 +518,7 @@ class Agent:
         self.online.reset_noise()
         self.target.reset_noise()
         self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
+
         # Soft target update
         for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
             target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
@@ -517,7 +533,8 @@ class Agent:
             'icm_optimizer': self.icm_optimizer.state_dict(),
             'frame_idx': self.frame_idx,
             'rewards': self.rewards,
-            'losses': self.losses,
+            'dqn_losses': self.dqn_losses,
+            'icm_losses': self.icm_losses,
             'eval_rewards': self.eval_rewards,
             'best_eval_reward': self.best_eval_reward,
             'buffer_state': self.buffer.get_state(),
@@ -532,7 +549,8 @@ class Agent:
         self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
         self.frame_idx = checkpoint['frame_idx']
         self.rewards = checkpoint['rewards']
-        self.losses = checkpoint['losses']
+        self.dqn_losses = checkpoint['dqn_losses']
+        self.icm_losses = checkpoint['icm_losses']
         self.eval_rewards = checkpoint.get('eval_rewards', [])
         self.best_eval_reward = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
@@ -545,18 +563,16 @@ class Agent:
 # -----------------------------
 def plot_figure(agent: Agent, episode: int):
     plt.figure(figsize=(20, 5))
-    plt.subplot(131)
+    plt.subplot(121)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(agent.rewards, label='Reward')
+    plt.plot([i * EVAL_INTERVAL for i in range(1, len(agent.eval_rewards) + 1)], agent.eval_rewards, label='Eval Reward')
     plt.legend()
-    plt.subplot(132)
+    plt.subplot(122)
     plt.title("Loss")
-    plt.plot(agent.losses, label='DQN Loss')
-    plt.legend()
-    plt.subplot(133)
-    plt.title("Eval Reward")
-    plt.plot([i * EVAL_INTERVAL for i in range(len(agent.eval_rewards))], agent.eval_rewards, label='Eval Reward')
+    plt.plot(agent.icm_losses, label='ICM Loss')
+    plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.legend()
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -564,6 +580,7 @@ def plot_figure(agent: Agent, episode: int):
     tqdm.write(f"Plot saved to {save_path}")
 
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+    agent.online.eval()
     eval_env = make_env()
     state = eval_env.reset()
     e_reward = 0
@@ -582,7 +599,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth
         agent.save_model(best_checkpoint_path)
         tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
 
-def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
+def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
     env = make_env()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     agent = Agent(env.observation_space.shape, env.action_space.n, device)
@@ -593,6 +610,8 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
     if os.path.isfile(checkpoint_path):
         agent.load_model(checkpoint_path)
         start_ep = len(agent.rewards) + 1
+
+    agent.online.train()
 
     # Warm-up
     state = env.reset()
@@ -606,6 +625,7 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
 
     # Training
     progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
+    progress_bar.update(len(agent.dqn_losses))
 
     for ep in range(start_ep, num_episodes + 1):
         state = env.reset()
@@ -632,28 +652,29 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
                 custom_reward += DEATH_PENALTY
                 prev_life = life
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
-            loss = agent.learn()
-            if loss is not None:
-                dqn_loss, icm_loss, int_r = loss
-                agent.losses.append(dqn_loss)
+            dqn_loss, icm_loss, _ = agent.learn()
+            if dqn_loss is not None:
+                agent.dqn_losses.append(dqn_loss)
+                agent.icm_losses.append(icm_loss)
             state = next_state
-            ep_reward += custom_reward
+            # ep_reward += custom_reward
             ep_env_reward += reward
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
                 break
 
-        agent.rewards.append(ep_reward)
+        agent.rewards.append(ep_env_reward)
         status = "TERMINATED" if done_flag else "TRUNCATED"
 
         # Logging
         if ep % PLOT_INTERVAL == 0:
             avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Episode {ep} | Reward {ep_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Status {status}")
+            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Stage {env.unwrapped._stage} | Status {status}")
 
         # Evaluation
         if ep % EVAL_INTERVAL == 0:
             evaluation(agent, ep, best_checkpoint_path)
+            agent.online.train()
 
         # Plot
         if ep % PLOT_INTERVAL == 0:
@@ -671,4 +692,4 @@ def train(num_episodes, checkpoint_path='models/rainbow_icm.pth', best_checkpoin
     env.close()
 
 if __name__ == '__main__':
-    train(num_episodes=100000)
+    train(num_episodes=10000)
