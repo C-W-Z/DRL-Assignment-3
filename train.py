@@ -24,9 +24,9 @@ STACK_FRAMES            = 4
 MAX_EPISODE_STEPS       = 3000
 
 # Agent
-TARGET_UPDATE           = 5000
-TAU                     = 1.0
-LEARNING_RATE           = 0.00025
+TARGET_UPDATE           = 1000
+TAU                     = 0.9
+LEARNING_RATE           = 0.0001
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 10000.0
@@ -148,11 +148,10 @@ class ICM(nn.Module):
 # Dueling Distributional Network
 # -----------------------------
 class DuelingDistNetwork(nn.Module):
-    def __init__(self, in_channels: int, n_actions: int, atom_size: int, support: torch.Tensor):
+    def __init__(self, in_channels: int, n_actions: int, support: torch.Tensor):
         super().__init__()
         self.support = support
         self.n_actions = n_actions
-        self.atom_size = atom_size
 
         self.feature_layer = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
@@ -169,12 +168,12 @@ class DuelingDistNetwork(nn.Module):
             self.feat_dim = self.feature_layer(dummy).shape[1]
 
         self.advantage_hidden_layer = NoisyLinear(self.feat_dim, 512)
-        self.advantage_layer = NoisyLinear(512, n_actions * atom_size)
+        self.advantage_layer = NoisyLinear(512, n_actions * ATOM_SIZE)
         self.value_hidden_layer = NoisyLinear(self.feat_dim, 512)
-        self.value_layer = NoisyLinear(512, atom_size)
+        self.value_layer = NoisyLinear(512, ATOM_SIZE)
 
     def get_features(self, x):
-        return self.feature_layer(x / 255.0)
+        return self.feature_layer(x)
 
     def forward(self, x):
         dist = self.dist(x)
@@ -185,10 +184,10 @@ class DuelingDistNetwork(nn.Module):
         x = self.get_features(x)
 
         advantage = F.relu(self.advantage_hidden_layer(x))
-        advantage = self.advantage_layer(advantage).view(-1, self.n_actions, self.atom_size)
+        advantage = self.advantage_layer(advantage).view(-1, self.n_actions, ATOM_SIZE)
 
         value = F.relu(self.value_hidden_layer(x))
-        value = self.value_layer(value).view(-1, 1, self.atom_size)
+        value = self.value_layer(value).view(-1, 1, ATOM_SIZE)
 
         q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
         dist = F.softmax(q_atoms, dim=-1)
@@ -229,9 +228,9 @@ def _get_beta_by_frame(frame_idx):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape, size, batch_size):
+    def __init__(self, obs_shape, size):
         self.obs_shape = obs_shape
-        self.max_size, self.batch_size = size, batch_size
+        self.max_size = size
         self.obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.next_obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
         self.acts_buf = np.zeros([size], dtype=np.int64)
@@ -273,13 +272,13 @@ class PrioritizedReplayBuffer:
         return reward, next_state, done
 
     def sample(self, frame_idx: int):
-        if self.size < self.batch_size:
+        if self.size < BATCH_SIZE:
             return None
         indices, weights = _sample_core(
             sum_tree=self.sum_tree.tree,
             min_tree=self.min_tree.tree,
             size=self.size,
-            batch_size=self.batch_size,
+            batch_size=BATCH_SIZE,
             beta=_get_beta_by_frame(frame_idx),
             capacity=self.sum_tree.capacity
         )
@@ -341,9 +340,9 @@ class Agent:
 
         self.support = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(self.device)
 
-        self.online = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(self.device)
+        self.online = DuelingDistNetwork(obs_shape[0], n_actions, self.support).to(self.device)
 
-        self.target = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(self.device)
+        self.target = DuelingDistNetwork(obs_shape[0], n_actions, self.support).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
@@ -352,7 +351,7 @@ class Agent:
         self.icm = ICM(self.online.feat_dim, n_actions).to(self.device)
         self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
 
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE)
+        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE)
 
         self.frame_idx = 0
         self.rewards = []
@@ -368,6 +367,55 @@ class Agent:
             q = self.online(s_t)
         return int(q.argmax(1).item())
 
+    # def act(self, state):
+    #     epsilon = max(EPSILON_MIN, EPSILON_START - self.frame_idx * (EPSILON_START - EPSILON_MIN) / EPSILON_FRAMES)
+    #     if np.random.rand() < epsilon:
+    #         return np.random.randint(self.n_actions)
+    #     s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+    #     with torch.no_grad():
+    #         q = self.online(s_t)
+    #     return int(q.argmax(1).item())
+
+    def compute_dqn_loss(self, batch, weights, int_r):
+        state = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
+        action = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
+        reward = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
+        next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
+        done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
+        weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+        reward += int_r
+
+        curr_dist = self.online.dist(state)
+        curr_dist = curr_dist[range(BATCH_SIZE), action]
+
+        with torch.no_grad():
+            next_action = self.online(next_state).argmax(1)
+            next_dist = self.target.dist(next_state)
+            next_dist = next_dist[range(BATCH_SIZE), next_action]
+
+            t_z = reward.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA_POW_N_STEP) * self.support.unsqueeze(0)
+            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
+            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
+            l = b.floor().long()
+            u = b.ceil().long()
+
+            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long() \
+                .unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
+
+            proj_dist = torch.zeros_like(next_dist)
+            proj_dist.view(-1).index_add_(
+                0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
+            )
+            proj_dist.view(-1).index_add_(
+                0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
+            )
+
+        log_p = torch.log(curr_dist.clamp(min=1e-3))
+        elementwise_loss = -(proj_dist * log_p).sum(1)
+        loss = (weights * elementwise_loss).mean()
+        return loss, elementwise_loss
+
     def learn(self):
         sample = self.buffer.sample(self.frame_idx)
         if sample is None:
@@ -377,71 +425,45 @@ class Agent:
         action = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
         r_ext = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
         next_state = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
-        done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
-        w = torch.tensor(weights, dtype=torch.float32, device=self.device)
-
-        # Compute distributional loss
-        curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
-        with torch.no_grad():
-            next_action = self.online(next_state).argmax(1)
-            next_dist = self.target.dist(next_state)[range(BATCH_SIZE), next_action]
-            t_z = r_ext.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long().unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        dqn_loss = (elementwise_loss * w).mean()
+        # done = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
+        # w = torch.tensor(weights, dtype=torch.float32, device=self.device)
 
         # ICM loss
         feat = self.online.get_features(state)
         next_feat = self.online.get_features(next_state)
-        logits, pred_phi_n, true_phi_n = self.icm(feat.detach(), next_feat.detach(), action)
+        logits, pred_phi_n, true_phi_n = self.icm(feat, next_feat, action)
         inv_loss = F.cross_entropy(logits, action)
-        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
+        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n)
         icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
         with torch.no_grad():
             int_r = ICM_ETA * 0.5 * (pred_phi_n - true_phi_n).pow(2).sum(dim=1)
+            int_r = int_r / (int_r.mean() + 1e-6) * r_ext.mean()  # 正規化
 
-        # Update DQN with combined reward
-        total_r = r_ext + int_r
-        curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
-        with torch.no_grad():
-            t_z = total_r.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        dqn_loss = (elementwise_loss * w).mean()
+        # Compute distributional loss with combined reward
+        dqn_loss, elementwise_loss = self.compute_dqn_loss(batch, weights, int_r)
 
-        # Optimize
+        # Optimize DQN and ICM separately
         self.optimizer.zero_grad()
-        self.icm_optimizer.zero_grad()
-        (dqn_loss + icm_loss).backward()
-        torch.nn.utils.clip_grad_norm_(list(self.online.parameters()) + list(self.icm.parameters()), 10.0)
+        dqn_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
         self.optimizer.step()
+
+        self.icm_optimizer.zero_grad()
+        icm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
         self.icm_optimizer.step()
 
         self.online.reset_noise()
         self.target.reset_noise()
-        self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
+
+        priorities = elementwise_loss.abs().detach().cpu().numpy()
+        priorities = priorities / (priorities.mean() + 1e-6)  # 正規化
+        self.buffer.update_priorities(indices, priorities)
 
         if self.frame_idx % TARGET_UPDATE == 0:
             if TAU == 1.0:
-                # Hard target update
                 self.target.load_state_dict(self.online.state_dict())
             else:
-                # Soft target update
                 for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
                     target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
 
