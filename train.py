@@ -22,7 +22,7 @@ Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state'
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = 3000
+MAX_EPISODE_STEPS       = 1000
 
 # Agent
 TARGET_UPDATE           = 1000

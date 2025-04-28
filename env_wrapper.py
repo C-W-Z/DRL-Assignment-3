@@ -30,6 +30,27 @@ class SkipAndMax(gym.Wrapper):
         self._obs_buffer[0] = self._obs_buffer[1] = obs
         return obs
 
+class LifeEpisode(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.lives = 2
+        self.real_done = True
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        self.real_done = done
+        lives = info.get('life', getattr(self.env.unwrapped, '_life', 0))
+        if lives < self.lives:
+            done = True
+        self.lives = lives
+        return obs, reward, done, info
+    def reset(self):
+        if self.real_done:
+            obs = self.env.reset()
+        else:
+            obs, _, _, _ = self.env.step(0)
+        self.lives = getattr(self.env.unwrapped, '_life', 2)
+        return obs
+
 class FrameProcessing(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -77,6 +98,7 @@ def make_env(skip_frames=4, stack_frames=4, max_episode_steps=3000):
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = SkipAndMax(env, skip=skip_frames)
+    env = LifeEpisode(env)
     env = FrameProcessing(env)
     env = FrameStack(env, n_steps=stack_frames)
     env = TimeLimit(env, max_episode_steps=max_episode_steps)
