@@ -49,18 +49,18 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 VELOCITY_REWARD         = 0
 BACKWARD_PENALTY        = -1
 STAY_PENALTY            = -1
-DEATH_PENALTY           = -10
+DEATH_PENALTY           = 0
 TRUNCATE_PENALTY        = -100
 
 # Intrinsic Curiosity Module
-ICM_BETA                = 0
+ICM_BETA                = 0.2
 ICM_ETA                 = 0.1
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 MAX_INTRINSIC_REWARD    = 0.0
 
 # Epsilon-Greedy
-EPSILON                 = 0.1
+EPSILON                 = 0.2
 
 # Output
 EVAL_INTERVAL           = 10
@@ -563,7 +563,7 @@ def plot_figure(agent: Agent, episode: int):
     plt.plot(agent.forward_losses, label='Forward Loss')
     plt.xlim(left=0.0, right=len(agent.inverse_losses))
     plt.ylim(bottom=0.0)
-    # plt.legend()
+    plt.legend()
 
     plt.subplot(224)
     plt.title("Intrinsic Reward")
@@ -671,8 +671,11 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
         while not done:
             agent.frame_idx += 1
-            if np.random.rand() < EPSILON:
+            r = np.random.rand()
+            if r < EPSILON / 2:
                 action = np.random.randint(6) # noop, right, jump
+            elif r < EPSILON:
+                action = np.random.randint(agent.n_actions)
             else:
                 action = agent.act(state)
             next_state, reward, done, info = env.step(action)
