@@ -31,10 +31,10 @@ LEARNING_RATE           = 0.00025
 ADAM_EPS                = 0.00015
 V_MIN                   = -1000.0
 V_MAX                   = 8000.0
-ATOM_SIZE               = 51
+ATOM_SIZE               = 101
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 2.5
+NOISY_STD_INIT          = 0.5
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
@@ -55,10 +55,14 @@ DEATH_PENALTY           = -100
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
-ICM_ETA                 = 1.0
-ICM_LR                  = 2e-4
+ICM_ETA                 = 0.5
+ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 MAX_INTRINSIC_REWARD    = 6.0
+ICM_LOSS_WEIGHT         = 0.1
+
+# Epsilon-Greedy
+EPSILON                 = 0
 
 # Output
 EVAL_INTERVAL           = 10
@@ -377,6 +381,7 @@ class Agent:
             q_value = self.online(state_tensor)
         return int(q_value.argmax(1).item())
 
+    # Categorical DQN (C51) Algorithm
     def compute_dqn_loss(self, state, action, reward, next_state, done, weights):
         curr_dist = self.online.dist(state)
         curr_dist = curr_dist[range(BATCH_SIZE), action]
@@ -429,11 +434,11 @@ class Agent:
                 param_min  = param.min().item()   # 最小值
                 param_stats.append(
                     f"{name}:{' ' * (max_len - len(name))}"
-                    f"norm={' ' if param_norm >= 0 else ''}{param_norm:2.4f},\t"
-                    f"mean={' ' if param_mean >= 0 else ''}{param_mean:.4f},\t"
-                    f"std={' ' if param_std >= 0 else ''}{param_std:.4f},\t"
-                    f"max={' ' if param_max >= 0 else ''}{param_max:.4f},\t"
-                    f"min={' ' if param_min >= 0 else ''}{param_min:.4f}"
+                    f"norm={' ' if param_norm >= 0 else ''}{param_norm:02.5f},\t"
+                    f"mean={' ' if param_mean >= 0 else ''}{param_mean:.5f},\t"
+                    f"std={' ' if param_std >= 0 else ''}{param_std:.5f},\t"
+                    f"max={' ' if param_max >= 0 else ''}{param_max:.5f},\t"
+                    f"min={' ' if param_min >= 0 else ''}{param_min:.5f}"
                 )
 
             # 打印統計信息
@@ -461,11 +466,11 @@ class Agent:
                     grad_min  = param.grad.min().item()
                     grad_stats.append(
                         f"{name}:{' ' * (max_len - len(name))}"
-                        f"grad_norm={' ' if grad_norm >= 0 else ''}{grad_norm:.4f},\t"
-                        f"grad_mean={' ' if grad_mean >= 0 else ''}{grad_mean:.4f},\t"
-                        f"grad_std={' ' if grad_std >= 0 else ''}{grad_std:.4f},\t"
-                        f"grad_max={' ' if grad_max >= 0 else ''}{grad_max:.4f},\t"
-                        f"grad_min={' ' if grad_min >= 0 else ''}{grad_min:.4f}"
+                        f"grad_norm={' ' if grad_norm >= 0 else ''}{grad_norm:.5f},\t"
+                        f"grad_mean={' ' if grad_mean >= 0 else ''}{grad_mean:.5f},\t"
+                        f"grad_std={' ' if grad_std >= 0 else ''}{grad_std:.5f},\t"
+                        f"grad_max={' ' if grad_max >= 0 else ''}{grad_max:.5f},\t"
+                        f"grad_min={' ' if grad_min >= 0 else ''}{grad_min:.5f}"
                     )
             print(f"\n[{model_name}] Gradient Statistics at Frame {self.frame_idx}:")
             for stat in grad_stats:
@@ -508,7 +513,7 @@ class Agent:
         # update DQN & ICM
         self.optimizer.zero_grad()
         self.icm_optimizer.zero_grad()
-        (dqn_loss + icm_loss).backward()
+        (dqn_loss + ICM_LOSS_WEIGHT * icm_loss).backward()
         U.clip_grad_norm_(self.online.parameters(), 5.0)
         U.clip_grad_norm_(self.icm.parameters(), 5.0)
         U.clip_grad_value_(self.online.parameters(), 1.0)
@@ -529,7 +534,7 @@ class Agent:
                 for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
                     target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
 
-        return dqn_loss.item(), icm_loss.item(), intrinsic_rewards.mean().item() # 返回損失值和內在獎勵
+        return dqn_loss.item(), ICM_LOSS_WEIGHT * icm_loss.item(), intrinsic_rewards.mean().item() # 返回損失值和內在獎勵
 
     def save_model(self, path):
         torch.save({
@@ -571,9 +576,9 @@ class Agent:
 # Training Loop
 # -----------------------------
 def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(21, 5))
+    plt.figure(figsize=(15, 15))
 
-    plt.subplot(131)
+    plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
@@ -581,20 +586,20 @@ def plot_figure(agent: Agent, episode: int):
     plt.xlim(left=1, right=len(agent.rewards))
     plt.legend()
 
-    plt.subplot(132)
+    plt.subplot(312)
     plt.title("Loss")
-    plt.plot(agent.icm_losses, label='ICM Loss')
     plt.plot(agent.dqn_losses, label='DQN Loss')
+    plt.plot(agent.icm_losses, label='ICM Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
     plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(0.9 * len(agent.dqn_losses)):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
     plt.legend()
 
-    plt.subplot(133)
+    plt.subplot(313)
     plt.title("Intrinsic Reward")
     plt.plot(agent.intrinsic_rewards, label='Intrinsic Reward')
     plt.xlim(left=0.0, right=len(agent.intrinsic_rewards))
     plt.ylim(bottom=0.0, top=MAX_INTRINSIC_REWARD)
-    plt.legend()
+    # plt.legend()
 
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -659,7 +664,10 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
         while not done:
             agent.frame_idx += 1
-            action = agent.act(state)
+            if np.random.rand() < EPSILON:
+                action = np.random.randint(6) # noop, right, jump
+            else:
+                action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
             done_flag = done and not truncated
