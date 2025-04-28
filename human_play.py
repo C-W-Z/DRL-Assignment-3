@@ -172,6 +172,8 @@ print("左+空格+Shift: 向左跳+衝刺")
 print("Ctrl+C: 退出（在pygame窗口按）")
 print("注意：請點擊pygame窗口（馬力歐畫面）激活鍵盤焦點！")
 
+# prev_x = None
+
 # 儲存trajectory
 trajectory = []
 total_reward = 0
@@ -191,8 +193,15 @@ while not done:
     next_state, reward, done, info = env.step(action)
     trajectory.append((state, action, reward, next_state, done))
     total_reward += reward
-    if reward != 0:
-        print(reward)
+    # if reward != 0:
+    #     print(reward)
+
+    # x_pos = info['x_pos']
+    # if prev_x is None:
+    #     prev_x = x_pos
+    # dx = x_pos - prev_x
+    # print(dx)
+    # prev_x = x_pos
 
     # 使用info中的raw_states進行渲染（選擇最後一幀）
     raw_state = info.get('raw_states', [state])[-1]  # 取最後一幀原始state

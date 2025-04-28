@@ -31,7 +31,7 @@ LEARNING_RATE           = 2e-4
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 1.0
+NOISY_STD_INIT          = 2.5
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
@@ -46,20 +46,21 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Customized Reward
-VELOCITY_REWARD         = 0.1
+VELOCITY_REWARD         = 0
+BACKWARD_PENALTY        = -1
 STAY_PENALTY            = -1
-DEATH_PENALTY           = -25
+DEATH_PENALTY           = -10
 TRUNCATE_PENALTY        = -100
 
 # Intrinsic Curiosity Module
-ICM_BETA                = 0.2
-ICM_ETA                 = 0.05
-ICM_LR                  = 2e-4
+ICM_BETA                = 0
+ICM_ETA                 = 0.1
+ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
-MAX_INTRINSIC_REWARD    = 3.0
+MAX_INTRINSIC_REWARD    = 0.0
 
 # Epsilon-Greedy
-EPSILON                 = 0
+EPSILON                 = 0.1
 
 # Output
 EVAL_INTERVAL           = 10
@@ -356,6 +357,7 @@ class Agent:
 
         self.frame_idx         = 0
         self.rewards           = []
+        self.custom_rewards    = []
         self.dqn_losses        = []
         self.icm_losses        = []
         self.eval_rewards      = []
@@ -499,6 +501,7 @@ class Agent:
             'icm_optimizer'    : self.icm_optimizer.state_dict(),
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
+            'custom_rewards'   : self.custom_rewards,
             'dqn_losses'       : self.dqn_losses,
             'icm_losses'       : self.icm_losses,
             'eval_rewards'     : self.eval_rewards,
@@ -518,8 +521,9 @@ class Agent:
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.icm.load_state_dict(checkpoint['icm'])
         self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
-        self.frame_idx         = checkpoint['frame_idx']
-        self.rewards           = checkpoint['rewards']
+        self.frame_idx         = checkpoint.get('frame_idx', 0)
+        self.rewards           = checkpoint.get('rewards', [])
+        self.custom_rewards    = checkpoint.get('custom_rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
         self.icm_losses        = checkpoint.get('icm_losses', [])
         self.eval_rewards      = checkpoint.get('eval_rewards', [])
@@ -536,6 +540,8 @@ def plot_figure(agent: Agent, episode: int):
     plt.subplot(221)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
+    diff = len(agent.rewards) - len(agent.custom_rewards)
+    plt.plot(diff + 1 + np.arange(len(agent.custom_rewards)), agent.custom_rewards, label='Custom+Intrinsic Reward')
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
     plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
     plt.xlim(left=1, right=len(agent.rewards))
@@ -676,6 +682,8 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             dx = x_pos - prev_x
             if dx == 0:
                 custom_reward += STAY_PENALTY
+            elif dx < 0:
+                custom_reward += BACKWARD_PENALTY
             else:
                 custom_reward += VELOCITY_REWARD * dx
             prev_x = x_pos
@@ -691,19 +699,19 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
 
             dqn_loss, icm_loss, int_reward = agent.learn()
-            if dqn_loss is not None:
-                agent.dqn_losses.append(dqn_loss)
-                agent.icm_losses.append(icm_loss)
-                agent.intrinsic_rewards.append(int_reward)
+            agent.dqn_losses.append(dqn_loss)
+            agent.icm_losses.append(icm_loss)
+            agent.intrinsic_rewards.append(int_reward)
 
             state = next_state
-            episode_custom_reward += custom_reward
+            episode_custom_reward += custom_reward + int_reward
             episode_reward += reward
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
                 break
 
         agent.rewards.append(episode_reward)
+        agent.custom_rewards.append(episode_custom_reward)
         if not done_flag:
             count_truncated += 1
 
@@ -719,8 +727,9 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
         # Logging
         if episode % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Truncated {count_truncated}")
+            avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:] if len(agent.rewards) >= PLOT_INTERVAL else agent.rewards)
+            avg_custom_reward = np.mean(agent.custom_rewards[-PLOT_INTERVAL:] if len(agent.custom_rewards) >= PLOT_INTERVAL else agent.custom_rewards)
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
             count_truncated = 0
 
         # Evaluation
