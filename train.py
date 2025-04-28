@@ -31,7 +31,7 @@ LEARNING_RATE           = 2e-4
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 2.5
+NOISY_STD_INIT          = 5.0
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
@@ -49,7 +49,7 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 VELOCITY_REWARD         = 0.05
 BACKWARD_PENALTY        = 0
 STUCK_PENALTY           = -0.1
-STUCK_STEP_THRESHOLD    = 100
+STUCK_STEP_THRESHOLD    = 125
 EARLY_TRUNCATE_THRESHOLD= 300
 TRUNCATE_PENALTY        = -50
 
@@ -58,14 +58,14 @@ EPSILON_START           = 1.0
 EPSILON_MIN             = 0.001
 EPSILON_THRESHOLD       = 0.2
 EPSILON_DECAY           = 0.975 # per episode
-EPSILON_DECAY_2         = 0.995
+EPSILON_DECAY_2         = 0.99
 
 # Output
-EVAL_INTERVAL           = 10
-SAVE_INTERVAL           = 100
-PLOT_INTERVAL           = 10
-CHECK_PARAM_INTERVAL    = 50
-CHECK_GRAD_INTERVAL     = 50
+EVAL_INTERVAL           = 30
+SAVE_INTERVAL           = 150
+PLOT_INTERVAL           = 30
+CHECK_PARAM_INTERVAL    = 150
+CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
@@ -464,20 +464,35 @@ class Agent:
 def plot_figure(agent: Agent, episode: int):
     plt.figure(figsize=(15, 15))
 
-    plt.subplot(211)
+    plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-    plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
+    plt.title(f"Life {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
     plt.plot(1 + np.arange(len(agent.custom_rewards)), agent.custom_rewards, label='Custom Reward')
-    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
     plt.xlim(left=1, right=len(agent.rewards))
+    plt.ylim(bottom=-1000.0)
     plt.legend()
 
-    plt.subplot(212)
+    arr = np.array(agent.rewards)
+    # 補 0 讓長度是3的倍數
+    if len(arr) % 3 != 0:
+        arr = np.pad(arr, (0, 3 - len(arr) % 3))
+    episode_rewards = arr.reshape(-1, 3).sum(axis=1)
+
+    plt.subplot(312)
+    avg_reward = np.mean(episode_rewards[-PLOT_INTERVAL//3:]) if len(episode_rewards) >= PLOT_INTERVAL//3 else np.mean(episode_rewards)
+    plt.title(f"Episode {episode // 3} | Avg Reward {avg_reward:.2f}")
+    plt.plot(1 + np.arange(len(episode_rewards)), episode_rewards, label='Reward')
+    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL // 3, agent.eval_rewards, label='Eval Reward')
+    plt.xlim(left=1, right=len(episode_rewards))
+    plt.ylim(bottom=-1000.0)
+    plt.legend()
+
+    plt.subplot(313)
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(0.9 * len(agent.dqn_losses)):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
+    plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(0.9 * len(agent.dqn_losses)):] if len(agent.rewards) >= MEMORY_SIZE else agent.dqn_losses))
     # plt.legend()
 
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
@@ -488,7 +503,7 @@ def plot_figure(agent: Agent, episode: int):
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
     with torch.no_grad():
         agent.online.eval()
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES)
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False)
         state = eval_env.reset()
         eval_reward = 0
         done = False

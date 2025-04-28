@@ -94,12 +94,14 @@ class FrameStack(gym.Wrapper):
         self.frames[-1] = obs
         return self.frames, reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, max_episode_steps=3000):
+def make_env(skip_frames=4, stack_frames=4, max_episode_steps=3000, life_episode=True):
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = SkipAndMax(env, skip=skip_frames)
-    env = LifeEpisode(env)
+    if life_episode:
+        env = LifeEpisode(env)
     env = FrameProcessing(env)
     env = FrameStack(env, n_steps=stack_frames)
-    # env = TimeLimit(env, max_episode_steps=max_episode_steps)
+    if not life_episode:
+        env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env
