@@ -359,7 +359,8 @@ class Agent:
         self.rewards           = []
         self.custom_rewards    = []
         self.dqn_losses        = []
-        self.icm_losses        = []
+        self.forward_losses    = []
+        self.inverse_losses    = []
         self.eval_rewards      = []
         self.intrinsic_rewards = []
         self.best_eval_reward  = -np.inf
@@ -490,7 +491,7 @@ class Agent:
                 for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
                     target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
 
-        return dqn_loss.item(), icm_loss.item(), intrinsic_rewards.mean().item() # 返回損失值和內在獎勵
+        return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_rewards.mean().item() # 返回損失值和內在獎勵
 
     def save_model(self, path):
         torch.save({
@@ -503,7 +504,8 @@ class Agent:
             'rewards'          : self.rewards,
             'custom_rewards'   : self.custom_rewards,
             'dqn_losses'       : self.dqn_losses,
-            'icm_losses'       : self.icm_losses,
+            'forward_losses'   : self.forward_losses,
+            'inverse_losses'   : self.inverse_losses,
             'eval_rewards'     : self.eval_rewards,
             'intrinsic_rewards': self.intrinsic_rewards,
             'best_eval_reward' : self.best_eval_reward,
@@ -525,7 +527,8 @@ class Agent:
         self.rewards           = checkpoint.get('rewards', [])
         self.custom_rewards    = checkpoint.get('custom_rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
-        self.icm_losses        = checkpoint.get('icm_losses', [])
+        self.forward_losses    = checkpoint.get('forward_losses', [])
+        self.inverse_losses    = checkpoint.get('inverse_losses', [])
         self.eval_rewards      = checkpoint.get('eval_rewards', [])
         self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
         self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
@@ -556,8 +559,9 @@ def plot_figure(agent: Agent, episode: int):
 
     plt.subplot(223)
     plt.title("ICM Loss")
-    plt.plot(agent.icm_losses, label='ICM Loss')
-    plt.xlim(left=0.0, right=len(agent.icm_losses))
+    plt.plot(agent.inverse_losses, label='Inverse Loss')
+    plt.plot(agent.forward_losses, label='Forward Loss')
+    plt.xlim(left=0.0, right=len(agent.inverse_losses))
     plt.ylim(bottom=0.0)
     # plt.legend()
 
@@ -613,11 +617,11 @@ def learn_human_play(agent: Agent):
             if agent.buffer.size < BATCH_SIZE:
                 continue
 
-            dqn_loss, icm_loss, int_reward = agent.learn()
-            if dqn_loss is not None:
-                agent.dqn_losses.append(dqn_loss)
-                agent.icm_losses.append(icm_loss)
-                agent.intrinsic_rewards.append(int_reward)
+            dqn_loss, forward_loss, inverse_loss, int_reward = agent.learn()
+            agent.dqn_losses.append(dqn_loss)
+            agent.forward_losses.append(forward_loss)
+            agent.inverse_losses.append(inverse_loss)
+            agent.intrinsic_rewards.append(int_reward)
 
         tqdm.write(f"Learn from {path}, total reward: {episode_reward}, frames: {len(trajectory)}")
 
@@ -698,9 +702,10 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
 
-            dqn_loss, icm_loss, int_reward = agent.learn()
+            dqn_loss, forward_loss, inverse_loss, int_reward = agent.learn()
             agent.dqn_losses.append(dqn_loss)
-            agent.icm_losses.append(icm_loss)
+            agent.forward_losses.append(forward_loss)
+            agent.inverse_losses.append(inverse_loss)
             agent.intrinsic_rewards.append(int_reward)
 
             state = next_state
