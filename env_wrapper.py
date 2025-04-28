@@ -101,5 +101,5 @@ def make_env(skip_frames=4, stack_frames=4, max_episode_steps=3000):
     env = LifeEpisode(env)
     env = FrameProcessing(env)
     env = FrameStack(env, n_steps=stack_frames)
-    env = TimeLimit(env, max_episode_steps=max_episode_steps)
+    # env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env

@@ -22,7 +22,7 @@ Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state'
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = 1000
+# MAX_EPISODE_STEPS       = 1000
 
 # Agent
 TARGET_UPDATE           = 1000
@@ -31,7 +31,7 @@ LEARNING_RATE           = 2e-4
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 1.0
+NOISY_STD_INIT          = 2.5
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
@@ -46,16 +46,19 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Customized Reward
-VELOCITY_REWARD         = 0.01
+VELOCITY_REWARD         = 0.05
 BACKWARD_PENALTY        = 0
 STUCK_PENALTY           = -0.1
-STUCK_STEP_THRESHOLD    = 150
-TRUNCATE_PENALTY        = -5
+STUCK_STEP_THRESHOLD    = 100
+EARLY_TRUNCATE_THRESHOLD= 300
+TRUNCATE_PENALTY        = -50
 
 # Epsilon-Greedy
 EPSILON_START           = 1.0
 EPSILON_MIN             = 0.001
-EPSILON_DECAY           = 0.95 # per episode
+EPSILON_THRESHOLD       = 0.2
+EPSILON_DECAY           = 0.975 # per episode
+EPSILON_DECAY_2         = 0.995
 
 # Output
 EVAL_INTERVAL           = 10
@@ -461,20 +464,16 @@ class Agent:
 def plot_figure(agent: Agent, episode: int):
     plt.figure(figsize=(15, 15))
 
-    plt.subplot(311)
+    plt.subplot(211)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
+    plt.plot(1 + np.arange(len(agent.custom_rewards)), agent.custom_rewards, label='Custom Reward')
     plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
     plt.xlim(left=1, right=len(agent.rewards))
     plt.legend()
 
-    plt.subplot(312)
-    avg_reward = np.mean(agent.custom_rewards[-PLOT_INTERVAL:]) if len(agent.custom_rewards) >= PLOT_INTERVAL else np.mean(agent.custom_rewards)
-    plt.title(f"Custom Reward | Avg {avg_reward:2f}")
-    plt.plot(1 + np.arange(len(agent.custom_rewards)), agent.custom_rewards, label='Custom Reward')
-
-    plt.subplot(313)
+    plt.subplot(212)
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
@@ -489,7 +488,7 @@ def plot_figure(agent: Agent, episode: int):
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
     with torch.no_grad():
         agent.online.eval()
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES)
         state = eval_env.reset()
         eval_reward = 0
         done = False
@@ -531,7 +530,7 @@ def learn_human_play(agent: Agent):
         tqdm.write(f"Learn from {path}, total reward: {episode_reward}, frames: {len(trajectory)}")
 
 def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
-    env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS)
+    env = make_env(SKIP_FRAMES, STACK_FRAMES)
     agent = Agent(env.observation_space.shape, env.action_space.n)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
@@ -562,18 +561,21 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
     count_truncated = 0
 
     for episode in range(start_episode, num_episodes + 1):
-        state = env.reset()
-        episode_reward = 0
+        state                 = env.reset()
+        episode_reward        = 0
         episode_custom_reward = 0
-        stuck_steps = 0
-        prev_x = None
-        done = False
+        steps                 = 0
+        stuck_steps           = 0
+        prev_x                = None
+        done                  = False
 
         agent.online.reset_noise()
         agent.target.reset_noise()
 
         while not done:
             agent.frame_idx += 1
+            steps += 1
+
             r = np.random.rand()
             if  r * 2 < agent.epsilon: # r < agent.epsilon / 2
                 action = np.random.randint(6) # noop, right, jump
@@ -583,7 +585,6 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 action = agent.act(state)
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
-            done_flag = done and not truncated
 
             # Reward Shaping
             custom_reward = reward
@@ -598,7 +599,10 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 stuck_steps += 1
             else:
                 stuck_steps = 0
-            if stuck_steps >= STUCK_STEP_THRESHOLD:
+
+            if stuck_steps >= EARLY_TRUNCATE_THRESHOLD:
+                truncated = True
+            elif stuck_steps >= STUCK_STEP_THRESHOLD:
                 custom_reward += STUCK_PENALTY
 
             if dx < 0:
@@ -610,7 +614,9 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 custom_reward += TRUNCATE_PENALTY
 
             # 放大小獎勵，縮小大獎勵
-            custom_reward = np.sign(custom_reward) * (np.sqrt(np.abs(custom_reward) + 1) - 1) + 0.001 * custom_reward
+            # custom_reward = np.sign(custom_reward) * (np.sqrt(np.abs(custom_reward) + 1) - 1) + 0.001 * custom_reward
+
+            done_flag = done and not truncated
 
             agent.buffer.store(state, action, custom_reward, next_state, done_flag)
 
@@ -623,9 +629,6 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
                 break
-
-        # Epsilon Decay
-        agent.epsilon = max(agent.epsilon * EPSILON_DECAY, EPSILON_MIN)
 
         agent.rewards.append(episode_reward)
         agent.custom_rewards.append(episode_custom_reward)
@@ -640,7 +643,14 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         if CHECK_GRAD_INTERVAL > 0 and episode % CHECK_GRAD_INTERVAL == 0:
             agent.check_gradients()
 
-        tqdm.write(f"Episode {episode} | Reward {episode_reward:.0f} | Custom Reward {episode_custom_reward:.1f} | Stage {env.unwrapped._stage} | Truncated {not done_flag} | Epsilon {agent.epsilon:.4f}")
+        # Logging
+        tqdm.write(f"Episode {episode} | Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {not done_flag}\t| Epsilon {agent.epsilon:.4f}")
+
+        # Epsilon Decay
+        if agent.epsilon <= EPSILON_THRESHOLD:
+            agent.epsilon = max(agent.epsilon * EPSILON_DECAY_2, EPSILON_MIN)
+        else:
+            agent.epsilon = max(agent.epsilon * EPSILON_DECAY, EPSILON_MIN)
 
         # Logging
         if episode % PLOT_INTERVAL == 0:
