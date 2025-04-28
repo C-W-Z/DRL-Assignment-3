@@ -29,9 +29,6 @@ TARGET_UPDATE           = 1000
 TAU                     = 0.25
 LEARNING_RATE           = 0.00025
 ADAM_EPS                = 0.00015
-V_MIN                   = -1000.0
-V_MAX                   = 8000.0
-ATOM_SIZE               = 101
 
 # Noisy Linear Layer
 NOISY_STD_INIT          = 0.5
@@ -59,7 +56,7 @@ ICM_ETA                 = 0.5
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
 MAX_INTRINSIC_REWARD    = 6.0
-ICM_LOSS_WEIGHT         = 0.1
+ICM_LOSS_WEIGHT         = 0.5
 
 # Epsilon-Greedy
 EPSILON                 = 0
@@ -158,12 +155,11 @@ class ICM(nn.Module):
         return logits, pred_phi_next, phi_next
 
 # -----------------------------
-# Dueling Distributional Network
+# Double Dueling Network
 # -----------------------------
-class DuelingDistNetwork(nn.Module):
-    def __init__(self, in_channels: int, n_actions: int, support: torch.Tensor):
+class DoubleDuelingNetwork(nn.Module):
+    def __init__(self, in_channels: int, n_actions: int):
         super().__init__()
-        self.support   = support
         self.n_actions = n_actions
 
         self.feature_layer = nn.Sequential(
@@ -181,31 +177,24 @@ class DuelingDistNetwork(nn.Module):
             self.feature_dimension  = self.feature_layer(dummy).shape[1]
 
         self.adv_hidden_layer = NoisyLinear(self.feature_dimension, 512)
-        self.advantage_layer  = NoisyLinear(512, self.n_actions * ATOM_SIZE)
+        self.advantage_layer  = NoisyLinear(512, self.n_actions)
         self.v_hidden_layer   = NoisyLinear(self.feature_dimension, 512)
-        self.value_layer      = NoisyLinear(512, ATOM_SIZE)
+        self.value_layer      = NoisyLinear(512, 1)
 
     def get_features(self, x):
         return self.feature_layer(x)
 
     def forward(self, x):
-        dist = self.dist(x)
-        q = torch.sum(dist * self.support, dim=2)
-        return q
-
-    def dist(self, x):
         x = self.get_features(x)
 
         advantage = F.relu(self.adv_hidden_layer(x))
-        advantage = self.advantage_layer(advantage).view(-1, self.n_actions, ATOM_SIZE)
+        advantage = self.advantage_layer(advantage)
 
         value = F.relu(self.v_hidden_layer(x))
-        value = self.value_layer(value).view(-1, 1, ATOM_SIZE)
+        value = self.value_layer(value)
 
-        q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
-        dist    = F.softmax(q_atoms, dim=-1)
-        dist    = dist.clamp(min=1e-3)
-        return dist
+        q = value + advantage - advantage.mean(dim=1, keepdim=True)
+        return q
 
     def reset_noise(self):
         self.adv_hidden_layer.reset_noise()
@@ -348,10 +337,8 @@ class Agent:
         self.device    = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.n_actions = n_actions
 
-        self.support   = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(self.device)
-
-        self.online    = DuelingDistNetwork(obs_shape[0], n_actions, self.support).to(self.device)
-        self.target    = DuelingDistNetwork(obs_shape[0], n_actions, self.support).to(self.device)
+        self.online    = DoubleDuelingNetwork(obs_shape[0], n_actions).to(self.device)
+        self.target    = DoubleDuelingNetwork(obs_shape[0], n_actions).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
@@ -380,38 +367,6 @@ class Agent:
         with torch.no_grad():
             q_value = self.online(state_tensor)
         return int(q_value.argmax(1).item())
-
-    # Categorical DQN (C51) Algorithm
-    def compute_dqn_loss(self, state, action, reward, next_state, done, weights):
-        curr_dist = self.online.dist(state)
-        curr_dist = curr_dist[range(BATCH_SIZE), action]
-
-        with torch.no_grad():
-            next_action = self.online(next_state).argmax(1)
-            next_dist = self.target.dist(next_state)
-            next_dist = next_dist[range(BATCH_SIZE), next_action]
-
-            t_z = reward.unsqueeze(1) + (1 - done).unsqueeze(1) * (GAMMA_POW_N_STEP) * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-
-            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long() \
-                .unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
-
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(
-                0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
-            )
-            proj_dist.view(-1).index_add_(
-                0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
-            )
-
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        loss = (weights * elementwise_loss).mean()
-        return loss, elementwise_loss
 
     def check_parameters(self):
         """檢查 online、target 和 icm 模塊的參數值大小"""
@@ -521,8 +476,6 @@ class Agent:
         self.optimizer.step()
         self.icm_optimizer.step()
 
-        self.online.reset_noise()
-        self.target.reset_noise()
         self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
         if self.frame_idx % TARGET_UPDATE == 0:
@@ -661,6 +614,9 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         prev_life = None
         done = False
         count_truncated = 0
+
+        agent.online.reset_noise()
+        agent.target.reset_noise()
 
         while not done:
             agent.frame_idx += 1
