@@ -22,12 +22,12 @@ Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state'
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = 1000
+MAX_EPISODE_STEPS       = None
 
 # Agent
-TARGET_UPDATE           = 1000
-TAU                     = 0.25
-LEARNING_RATE           = 1e-5
+TARGET_UPDATE           = 5000
+TAU                     = 0.5
+LEARNING_RATE           = 5e-6
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
@@ -46,16 +46,16 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Customized Reward
-VELOCITY_REWARD         = 0.01
-BACKWARD_PENALTY        = -1
-TRUNCATE_PENALTY        = -100
-STUCK_PENALTY           = -1
-STUCK_PENALTY_STEP      = 150
-STUCK_TRUNCATE_STEP     = 300
+VELOCITY_REWARD         = 0
+BACKWARD_PENALTY        = 0
+TRUNCATE_PENALTY        = 0
+STUCK_PENALTY           = 0
+STUCK_PENALTY_STEP      = None
+STUCK_TRUNCATE_STEP     = None
 
 # Epsilon-Greedy
-EPSILON_START           = 1.0
-EPSILON_MIN             = 0.001
+EPSILON_START           = 0
+EPSILON_MIN             = 0
 EPSILON_DECAY           = 0.975 # per episode
 
 # Output
@@ -115,7 +115,7 @@ class NoisyLinear(nn.Module):
 # -----------------------------
 # Double Dueling Deep Recurrent Q Network
 # -----------------------------
-class DDDRQN(nn.Module):
+class D3QN(nn.Module):
     def __init__(self, in_channels: int, n_actions: int):
         super().__init__()
         self.n_actions = n_actions
@@ -143,11 +143,8 @@ class DDDRQN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 m.bias.data.fill_(0.01)
 
-    def get_features(self, x):
-        return self.feature_layer(x)
-
     def forward(self, x):
-        x = self.get_features(x)
+        x = self.feature_layer(x)
 
         advantage = F.relu(self.adv_hidden_layer(x))
         advantage = self.advantage_layer(advantage)
@@ -299,8 +296,8 @@ class Agent:
         self.device    = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         self.n_actions = n_actions
 
-        self.online    = DDDRQN(obs_shape[0], n_actions).to(self.device)
-        self.target    = DDDRQN(obs_shape[0], n_actions).to(self.device)
+        self.online    = D3QN(obs_shape[0], n_actions).to(self.device)
+        self.target    = D3QN(obs_shape[0], n_actions).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
@@ -309,7 +306,7 @@ class Agent:
         self.buffer = PrioritizedReplayBuffer(obs_shape)
 
         # 初始化損失函數
-        self.dqn_criterion     = nn.SmoothL1Loss(reduction='none')  # 用於 DQN Loss，逐元素計算
+        self.dqn_criterion     = nn.MSELoss(reduction='none')  # 用於 DQN Loss，逐元素計算
 
         self.epsilon           = EPSILON_START
         self.frame_idx         = 0
@@ -501,23 +498,29 @@ def plot_figure(agent: Agent, episode: int):
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
     with torch.no_grad():
         agent.online.eval()
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, 3 * MAX_EPISODE_STEPS, False)
-        state = eval_env.reset()
-        eval_reward = 0
-        done = False
-        while not done:
-            e_action = agent.act(state)
-            state, reward, done, _ = eval_env.step(e_action)
-            eval_reward += reward
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, True)
+        eval_rewards = [0, 0, 0]
+        for i in range(3):
+            state = eval_env.reset()
+            eval_reward = 0
+            done = False
+            while not done:
+                e_action = agent.act(state)
+                state, reward, done, _ = eval_env.step(e_action)
+                eval_reward += reward
+            eval_rewards[i] = eval_reward
         eval_env.close()
-        agent.eval_rewards.append(eval_reward)
-        if eval_reward > agent.best_eval_reward:
-            agent.best_eval_reward = eval_reward
-        tqdm.write(f"Eval Reward: {eval_reward:.0f} | Best Eval Reward: {agent.best_eval_reward:.0f}")
 
-        if eval_reward >= 3000 and eval_reward == agent.best_eval_reward:
+        total_eval_reward = sum(eval_rewards)
+        agent.eval_rewards.append(total_eval_reward)
+        if total_eval_reward > agent.best_eval_reward:
+            agent.best_eval_reward = total_eval_reward
+
+        tqdm.write(f"Eval Reward: {eval_rewards[0]:.0f}+{eval_rewards[1]:.0f}+{eval_rewards[2]:.0f}={total_eval_reward:.0f} | Best Eval Reward: {agent.best_eval_reward:.0f}")
+
+        if total_eval_reward >= 3000 and total_eval_reward == agent.best_eval_reward:
             agent.save_model(best_checkpoint_path)
-            tqdm.write(f"Best model saved at episode {episode} with Eval Reward {eval_reward:.0f}")
+            tqdm.write(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
 
 def learn_human_play(agent: Agent):
     import pickle
@@ -578,8 +581,8 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         episode_reward        = 0
         episode_custom_reward = 0
         steps                 = 0
-        stuck_steps           = 0
-        prev_x                = None
+        # stuck_steps           = 0
+        # prev_x                = None
         done                  = False
         truncated             = False
 
@@ -601,33 +604,33 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             # Reward Shaping
             custom_reward = reward
 
-            x_pos = info['x_pos']
-            if prev_x is None:
-                prev_x = x_pos
-            dx = x_pos - prev_x
-            prev_x = x_pos
+            # x_pos = info['x_pos']
+            # if prev_x is None:
+            #     prev_x = x_pos
+            # dx = x_pos - prev_x
+            # prev_x = x_pos
 
-            if dx <= 1:
-                stuck_steps += 1
-            else:
-                stuck_steps = 0
+            # if dx <= 1:
+            #     stuck_steps += 1
+            # else:
+            #     stuck_steps = 0
 
-            if stuck_steps >= STUCK_PENALTY_STEP:
-                custom_reward += STUCK_PENALTY
-            if stuck_steps >= STUCK_TRUNCATE_STEP:
-                truncated = True
-                done = True
+            # if stuck_steps >= STUCK_PENALTY_STEP:
+            #     custom_reward += STUCK_PENALTY
+            # if stuck_steps >= STUCK_TRUNCATE_STEP:
+            #     truncated = True
+            #     done = True
 
-            if dx < 0:
-                custom_reward += BACKWARD_PENALTY
+            # if dx < 0:
+            #     custom_reward += BACKWARD_PENALTY
             # else:
             #     custom_reward += VELOCITY_REWARD * dx
-            v = episode_reward / steps
-            if v >= 3.0:
-                custom_reward += VELOCITY_REWARD * v
+            # v = episode_reward / steps
+            # if v >= 3.0:
+            #     custom_reward += VELOCITY_REWARD * v
 
-            if truncated:
-                custom_reward += TRUNCATE_PENALTY
+            # if truncated:
+            #     custom_reward += TRUNCATE_PENALTY
 
             # custom_reward = np.sign(custom_reward) * (np.sqrt(np.abs(custom_reward) + 1) - 1) + custom_reward / 12.0
 
