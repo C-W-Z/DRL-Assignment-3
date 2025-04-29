@@ -27,15 +27,15 @@ MAX_EPISODE_STEPS       = 1000
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 5e-5
+LEARNING_RATE           = 1e-5
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 2.5
+NOISY_STD_INIT          = 0.5
 
 # Prioritized Replay Buffer
-MEMORY_SIZE             = 50000
-BATCH_SIZE              = 64
+MEMORY_SIZE             = 30000
+BATCH_SIZE              = 128
 GAMMA                   = 0.99
 N_STEP                  = 5
 ALPHA                   = 0.6
@@ -46,7 +46,7 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Customized Reward
-VELOCITY_REWARD         = 0.1
+VELOCITY_REWARD         = 0.01
 BACKWARD_PENALTY        = -1
 TRUNCATE_PENALTY        = -100
 STUCK_PENALTY           = -1
@@ -590,10 +590,7 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
             agent.frame_idx += 1
             steps += 1
 
-            r = np.random.rand()
-            if  r * 2 < agent.epsilon: # r < agent.epsilon / 2
-                action = np.random.randint(6) # noop, right, jump
-            elif r < agent.epsilon:
+            if np.random.rand() < agent.epsilon:
                 action = np.random.randint(agent.n_actions)
             else:
                 action = agent.act(state)
@@ -625,14 +622,14 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
                 custom_reward += BACKWARD_PENALTY
             # else:
             #     custom_reward += VELOCITY_REWARD * dx
-            v = reward / steps
-            if v >= 3:
+            v = episode_reward / steps
+            if v >= 3.0:
                 custom_reward += VELOCITY_REWARD * v
 
             if truncated:
                 custom_reward += TRUNCATE_PENALTY
 
-            custom_reward = np.sign(custom_reward) * np.sqrt(np.abs(custom_reward)) + custom_reward / 12.0
+            # custom_reward = np.sign(custom_reward) * (np.sqrt(np.abs(custom_reward) + 1) - 1) + custom_reward / 12.0
 
             agent.buffer.store(state, action, custom_reward, next_state, done or truncated)
 
