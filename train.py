@@ -27,11 +27,11 @@ MAX_EPISODE_STEPS       = 1000
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 1e-4
+LEARNING_RATE           = 5e-5
 ADAM_EPS                = 0.00015
 
 # Noisy Linear Layer
-NOISY_STD_INIT          = 5.0
+NOISY_STD_INIT          = 2.5
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50000
@@ -46,19 +46,17 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Customized Reward
-VELOCITY_REWARD         = 0.01
-BACKWARD_PENALTY        = -0.1
+VELOCITY_REWARD         = 0.1
+BACKWARD_PENALTY        = -1
 TRUNCATE_PENALTY        = -100
-STUCK_PENALTY           = -0.1
+STUCK_PENALTY           = -1
 STUCK_PENALTY_STEP      = 150
 STUCK_TRUNCATE_STEP     = 300
 
 # Epsilon-Greedy
 EPSILON_START           = 1.0
-EPSILON_MIN             = 0.01
-EPSILON_THRESHOLD       = 0.2
+EPSILON_MIN             = 0.001
 EPSILON_DECAY           = 0.975 # per episode
-EPSILON_DECAY_2         = 0.999
 
 # Output
 EVAL_INTERVAL           = 30
@@ -625,11 +623,16 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
 
             if dx < 0:
                 custom_reward += BACKWARD_PENALTY
-            else:
-                custom_reward += VELOCITY_REWARD * dx
+            # else:
+            #     custom_reward += VELOCITY_REWARD * dx
+            v = reward / steps
+            if v >= 3:
+                custom_reward += VELOCITY_REWARD * v
 
             if truncated:
                 custom_reward += TRUNCATE_PENALTY
+
+            custom_reward = np.sign(custom_reward) * np.sqrt(np.abs(custom_reward)) + custom_reward / 12.0
 
             agent.buffer.store(state, action, custom_reward, next_state, done or truncated)
 
@@ -660,10 +663,7 @@ def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_chec
         tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}\t| Epsilon {agent.epsilon:.4f}")
 
         # Epsilon Decay
-        if agent.epsilon <= EPSILON_THRESHOLD:
-            agent.epsilon = max(agent.epsilon * EPSILON_DECAY_2, EPSILON_MIN)
-        else:
-            agent.epsilon = max(agent.epsilon * EPSILON_DECAY, EPSILON_MIN)
+        agent.epsilon = max(agent.epsilon * EPSILON_DECAY, EPSILON_MIN)
 
         # Logging
         if episode % PLOT_INTERVAL == 0:

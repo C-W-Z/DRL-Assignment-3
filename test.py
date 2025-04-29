@@ -4,7 +4,7 @@ from train import Agent, Transition
 env = make_env(life_episode=False)
 
 agent = Agent(env.observation_space.shape, env.action_space.n)
-agent.load_model("./models/best.pth", eval_mode=True)
+agent.load_model("./models/rainbow_icm.pth", eval_mode=True)
 
 state = env.reset()
 done = False
