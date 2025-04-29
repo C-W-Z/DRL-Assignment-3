@@ -99,128 +99,26 @@ class CustomReward(gym.Wrapper):
 
     def __init__(self, env):
         super(CustomReward, self).__init__(env)
-        self._current_score = 0
         self._current_life = 2
 
     def reset(self):
-        self._current_score = 0
         self._current_life = 2
         return self.env.reset()
 
     def step(self, action):
         state, reward, done, info = self.env.step(action)
 
-        # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
-
-        score = info["score"]
         life = info["life"]
 
         if reward <= 0:
             reward -= 0.1
-        # reward *= 10
-
-        reward += (score - self._current_score) / 50
 
         if life < self._current_life:
             reward -= 50
 
-        self._current_score = score
         self._current_life = life
 
-        if info["flag_get"]:
-            reward += 500
-
         return state, reward, done, info
-
-# class CustomReward(gym.Wrapper):
-
-#     def __init__(self, env):
-#         super(CustomReward, self).__init__(env)
-#         self._current_score = 0
-#         self._max_x_pos = 0
-#         self._current_time = 400
-#         self._current_life = 2
-#         self._current_coins = 0
-#         self._current_status = 'small'
-
-#     def reset(self):
-#         # 重置環境時，重置所有狀態
-#         self._current_score = 0
-#         self._max_x_pos = 0
-#         self._current_time = 400
-#         self._current_life = 2
-#         self._current_coins = 0
-#         self._current_status = 'small'
-#         return self.env.reset()
-
-#     def step(self, action):
-#         state, reward, done, info = self.env.step(action)
-
-#         # info: {'coins': 0, 'flag_get': False, 'life': 2, 'score': 0, 'stage': 1, 'status': 'small', 'time': 393, 'world': 1, 'x_pos': 244, 'y_pos': 102}
-
-#         # 提取 info 中的資訊
-#         x_pos = info["x_pos"]
-#         time = info["time"]
-#         life = info["life"]
-#         score = info["score"]
-#         coins = info["coins"]
-#         flag_get = info["flag_get"]
-#         status = info["status"]
-
-#         # 初始化總獎勵
-#         total_reward = 0.0
-
-#         # 1. 前進獎勵 (v): 根據 x_pos 的變化
-#         v = max(0, x_pos - self._max_x_pos) * 2  # 縮放係數 0.1
-#         total_reward += v
-
-#         # 2. 時間懲罰 (c): 根據 time 的變化
-#         c = (self._current_time - time) * -1  # 每減少 1 單位時間，懲罰 -0.5
-#         total_reward += c
-
-#         # 3. 死亡懲罰 (d): 根據 life 的減少
-#         d = 0
-#         if life < self._current_life:  # 生命減少表示死亡
-#             d = -50  # 死亡懲罰
-#         total_reward += d
-
-#         # 4. 分數增量 (s): 根據 score 的增量
-#         s = (score - self._current_score) * 0.5  # 縮放係數 0.1
-#         total_reward += s
-
-#         # 5. 硬幣獎勵 (coin): 根據 coins 的增量
-#         coin = (coins - self._current_coins) * 20  # 每收集 1 個硬幣獎勵 10
-#         total_reward += coin
-
-#         # 6. 終點獎勵 (flag): 如果到達終點旗幟
-#         if flag_get:
-#             total_reward += 150  # 到達終點獎勵
-
-#         # 7. 狀態獎勵 (status): 根據 Mario 狀態的變化
-#         status_reward = 0
-#         status_map = {'small': 0, 'tall': 1, 'fireball': 2}  # 定義狀態的價值
-#         current_status_value = status_map.get(self._current_status, 0)
-#         new_status_value = status_map.get(status, 0)
-#         if new_status_value > current_status_value:  # 狀態提升（例如 small -> tall）
-#             status_reward = 50  # 狀態提升獎勵
-#         elif new_status_value < current_status_value:  # 狀態下降（例如 tall -> small）
-#             status_reward = -20  # 狀態下降懲罰
-#         total_reward += status_reward
-
-#         # 裁剪獎勵到 [-50, 50] 範圍，避免過大或過小的值
-#         total_reward = np.clip(total_reward / 10, -15, 15)
-
-#         # total_reward += reward
-
-#         # 更新當前狀態
-#         self._max_x_pos = max(self._max_x_pos, x_pos)
-#         self._current_time = time
-#         self._current_life = life
-#         self._current_score = score
-#         self._current_coins = coins
-#         self._current_status = status
-
-#         return state, total_reward, done, info
 
 def make_env(env):
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
@@ -485,11 +383,9 @@ class NoisyLinear(nn.Module):
 
 # 5. Network（改為 CNN）
 class Network(nn.Module):
-    def __init__(self, in_channels: int, out_dim: int, atom_size: int, support: torch.Tensor):
+    def __init__(self, in_channels: int, out_dim: int):
         super(Network, self).__init__()
-        self.support = support
         self.out_dim = out_dim
-        self.atom_size = atom_size
 
         self.feature_layer = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
@@ -504,25 +400,18 @@ class Network(nn.Module):
         )
 
         self.advantage_hidden_layer = NoisyLinear(512, 512)
-        self.advantage_layer = NoisyLinear(512, out_dim * atom_size)
+        self.advantage_layer = NoisyLinear(512, out_dim)
         self.value_hidden_layer = NoisyLinear(512, 512)
-        self.value_layer = NoisyLinear(512, atom_size)
+        self.value_layer = NoisyLinear(512, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dist = self.dist(x)
-        q = torch.sum(dist * self.support, dim=2)
-        return q
-
-    def dist(self, x: torch.Tensor) -> torch.Tensor:
         feature = self.feature_layer(x)
         adv_hid = F.relu(self.advantage_hidden_layer(feature))
         val_hid = F.relu(self.value_hidden_layer(feature))
-        advantage = self.advantage_layer(adv_hid).view(-1, self.out_dim, self.atom_size)
-        value = self.value_layer(val_hid).view(-1, 1, self.atom_size)
-        q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
-        dist = F.softmax(q_atoms, dim=-1)
-        dist = dist.clamp(min=1e-3)
-        return dist
+        advantage = self.advantage_layer(adv_hid)
+        value = self.value_layer(val_hid)
+        q = value + advantage - advantage.mean(dim=1, keepdim=True)
+        return q
 
     def reset_noise(self):
         self.advantage_hidden_layer.reset_noise()
@@ -543,9 +432,6 @@ class RainbowDQNAgent:
         alpha: float = 0.6,
         beta: float = 0.4,
         prior_eps: float = 1e-6,
-        v_min: float = -500.0,
-        v_max: float = 5000.0,
-        atom_size: int = 51,
         n_step: int = 3,
         tau: float = 0.9,
         lr: float = 0.0001,
@@ -579,13 +465,8 @@ class RainbowDQNAgent:
         self.beta = beta
         self.beta_increment = (1.0 - beta) / 1000000
 
-        self.v_min = v_min
-        self.v_max = v_max
-        self.atom_size = atom_size
-        self.support = torch.linspace(v_min, v_max, atom_size).to(self.device)
-
-        self.dqn = Network(obs_shape[0], action_dim, atom_size, self.support).to(self.device)
-        self.dqn_target = Network(obs_shape[0], action_dim, atom_size, self.support).to(self.device)
+        self.dqn = Network(obs_shape[0], action_dim).to(self.device)
+        self.dqn_target = Network(obs_shape[0], action_dim).to(self.device)
         self.dqn_target.load_state_dict(self.dqn.state_dict())
         self.dqn_target.eval()
 
@@ -611,7 +492,7 @@ class RainbowDQNAgent:
         next_state, reward, done, info = self.env.step(action)
         return next_state, reward, done
 
-    def compute_dqn_loss(self, samples: Dict[str, np.ndarray]) -> torch.Tensor:
+    def compute_dqn_loss(self, samples: Dict[str, np.ndarray]) -> Tuple[torch.Tensor, torch.Tensor]:
         state = torch.FloatTensor(samples["obs"]).to(self.device)
         next_state = torch.FloatTensor(samples["next_obs"]).to(self.device)
         action = torch.LongTensor(samples["acts"]).to(self.device)
@@ -619,35 +500,30 @@ class RainbowDQNAgent:
         done = torch.FloatTensor(samples["done"]).to(self.device)
         weights = torch.FloatTensor(samples["weights"]).to(self.device)
 
-        curr_dist = self.dqn.dist(state)
-        curr_dist = curr_dist[range(self.batch_size), action]
+        # current Q value
+        q_values = self.dqn(state)
+        q_value = q_values.gather(1, action.unsqueeze(1)).squeeze(1)  # shape: (batch,)
 
         with torch.no_grad():
-            next_action = self.dqn(next_state).argmax(1)
-            next_dist = self.dqn_target.dist(next_state)
-            next_dist = next_dist[range(self.batch_size), next_action]
+            # Double DQN: action from online, Q-value from target
+            next_q_values = self.dqn(next_state)
+            next_actions = next_q_values.argmax(dim=1, keepdim=True)  # shape: (batch, 1)
 
-            t_z = reward.unsqueeze(1) + (1 - done).unsqueeze(1) * (self.gamma ** self.memory.n_step) * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=self.v_min, max=self.v_max)
-            b = (t_z - self.v_min) / ((self.v_max - self.v_min) / (self.atom_size - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
+            next_q_target = self.dqn_target(next_state)
+            next_q_value = next_q_target.gather(1, next_actions).squeeze(1)
 
-            offset = torch.linspace(0, (self.batch_size - 1) * self.atom_size, self.batch_size).long() \
-                .unsqueeze(1).expand(self.batch_size, self.atom_size).to(self.device)
+            target = reward + (1.0 - done) * self.gamma * next_q_value
 
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(
-                0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1)
-            )
-            proj_dist.view(-1).index_add_(
-                0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1)
-            )
+        # TD Error
+        td_error = q_value - target
 
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        loss = (weights * elementwise_loss).mean()
-        return loss, elementwise_loss
+        # Choose loss: MSE or Huber
+        # elementwise_loss = F.mse_loss(q_value, target, reduction="none")
+        elementwise_loss = F.smooth_l1_loss(q_value, target, reduction="none")
+
+        # PER importance-sampling weighted loss
+        loss = (elementwise_loss * weights).mean()
+        return loss, td_error
 
     def update_model(self) -> torch.Tensor:
         if self.update_count % self.noise_reset_interval == 0:
@@ -658,7 +534,7 @@ class RainbowDQNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        clip_grad_norm_(self.dqn.parameters(), 10.0)
+        clip_grad_norm_(self.dqn.parameters(), 5.0)
         self.optimizer.step()
 
         priorities = elementwise_loss.abs().detach().cpu().numpy() + self.prior_eps
@@ -807,25 +683,22 @@ if __name__ == "__main__":
 
     agent = RainbowDQNAgent(
         env=env,
-        memory_size=10000,
+        memory_size=30000,
         batch_size=128,
         target_update=5000,
-        seed=1226,
+        seed=-1,
         gamma=0.99,
         alpha=0.6,
         beta=0.4,
         prior_eps=1e-6,
-        v_min=-1000.0,
-        v_max=7000.0,
-        atom_size=51,
         n_step=5,
-        tau=0.85,
+        tau=0.5,
         lr=0.00005,
         avg_window_size=100,
         model_save_dir="./models",
         plot_dir="./plots"
     )
 
-    agent.load_model("./models/Episode450.pth")
-    agent.train(num_episodes=1000, save_interval=10, plot_interval=10)
+    # agent.load_model("./models/Episode450.pth")
+    agent.train(num_episodes=1000, save_interval=50, plot_interval=10)
     env.close()

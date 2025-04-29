@@ -6,8 +6,10 @@ drl-hw3
 ll
 models
 plots
+human_play
 
 *test*
 *log*
 *rainbow*
 convert.py
+*trajectory*.py
