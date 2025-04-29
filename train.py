@@ -337,7 +337,7 @@ class Agent:
             "icm": self.icm
         }
 
-        max_len = len("advantage_layer.    ")
+        max_len = len("advantage_layer.0.weight:")
 
         for model_name, model in models.items():
             param_stats = []
@@ -369,7 +369,7 @@ class Agent:
             "icm": self.icm
         }
 
-        max_len = len("advantage_layer.    ")
+        max_len = len("advantage_layer.0.weight")
 
         for model_name, model in models.items():
             grad_stats = []
