@@ -50,11 +50,6 @@ STUCK_PENALTY           = 0
 STUCK_PENALTY_STEP      = None
 STUCK_TRUNCATE_STEP     = None
 
-# Epsilon-Greedy
-EPSILON_START           = 0
-EPSILON_MIN             = 0
-EPSILON_DECAY           = 0.975 # per episode
-
 # Output
 EVAL_INTERVAL           = 30
 SAVE_INTERVAL           = 150
@@ -260,7 +255,6 @@ class Agent:
         self.icm_criterion_forward = nn.MSELoss(reduction='none')
         self.icm_criterion_inverse = nn.CrossEntropyLoss()
 
-        self.epsilon           = EPSILON_START
         self.frame_idx         = 0
         self.rewards           = []
         self.custom_rewards    = []
@@ -386,7 +380,6 @@ class Agent:
             'online'           : self.online.state_dict(),
             'target'           : self.target.state_dict(),
             'optimizer'        : self.optimizer.state_dict(),
-            'epsilon'          : self.epsilon,
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
             'custom_rewards'   : self.custom_rewards,
@@ -404,7 +397,6 @@ class Agent:
             return
         self.target.load_state_dict(checkpoint['target'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
         self.frame_idx         = checkpoint.get('frame_idx', 0)
         self.rewards           = checkpoint.get('rewards', [])
         self.custom_rewards    = checkpoint.get('custom_rewards', [])
@@ -551,10 +543,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.frame_idx += 1
             steps += 1
 
-            if np.random.rand() < agent.epsilon:
-                action = np.random.randint(agent.n_actions)
-            else:
-                action = agent.act(state)
+            action = agent.act(state)
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
@@ -618,10 +607,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.check_gradients()
 
         # Logging
-        tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}\t| Epsilon {agent.epsilon:.4f}")
-
-        # Epsilon Decay
-        agent.epsilon = max(agent.epsilon * EPSILON_DECAY, EPSILON_MIN)
+        tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}")
 
         # Logging
         if episode % PLOT_INTERVAL == 0:
