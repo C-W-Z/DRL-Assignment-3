@@ -47,6 +47,7 @@ ICM_BETA                = 0.2
 ICM_ETA                 = 1.0
 ICM_LR                  = 1e-4
 ICM_EMBED_DIM           = 256
+ICM_REWARD_SCALE        = 0.1
 
 # Customized Reward
 VELOCITY_REWARD         = 0
@@ -316,9 +317,17 @@ class Agent:
 
     def act(self, state):
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            q_value = self.online(state_tensor)
-        return int(q_value.argmax(dim=1).item())
+        if not self.online.training:
+            with torch.no_grad():
+                q_value = self.online(state_tensor)
+            return int(q_value.argmax(dim=1).item())
+        else:
+            # Boltzmann Exploration
+            with torch.no_grad():
+                q_values = self.online(state_tensor) / 1  # a high tau means more randomness
+                probabilities = F.softmax(q_values, dim=1)
+                action = torch.multinomial(probabilities, num_samples=1).item()
+                return action
 
     def check_parameters(self):
         """檢查 online、target 模塊的參數值大小"""
@@ -402,18 +411,15 @@ class Agent:
         forward_loss = self.icm_criterion_forward(pred_phi_next, true_phi_next).mean(dim=1)
         forward_loss = (forward_loss * weights).mean()
 
-        intrinsic_reward = ICM_ETA * 0.5 * (pred_phi_next - true_phi_next).pow(2).sum(dim=1)
-        int_r_mean       = intrinsic_reward.mean()
-        intrinsic_reward = intrinsic_reward / (int_r_mean + 1e-8)
-
-        # total reward for DQN
-        total_reward = rewards + intrinsic_reward.detach()
+        with torch.no_grad():
+            intrinsic_reward = ICM_REWARD_SCALE * ICM_ETA * forward_loss.detach()
+            # intrinsic_reward = intrinsic_reward / (intrinsic_reward.mean() + 1e-8)
 
         # ------- DQN --------
         with torch.no_grad():
             next_actions = self.online(next_states).argmax(1)
             q_next       = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            q_target     = total_reward + GAMMA_POW_N_STEP * q_next * (1 - dones)
+            q_target     = rewards + intrinsic_reward + GAMMA_POW_N_STEP * q_next * (1 - dones)
         q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         td_value    = q_predicted - q_target.detach()
         dqn_loss    = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
@@ -442,7 +448,7 @@ class Agent:
                 for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
                     target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
 
-        return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), int_r_mean.item()
+        return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 
     def save_model(self, path):
         torch.save({
