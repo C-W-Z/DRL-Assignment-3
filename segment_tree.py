@@ -146,9 +146,9 @@ def _sample_core(
 class SegmentTree:
     """Base SegmentTree class with Numba optimization."""
     def __init__(self, capacity: int, operation: str, init_value: float):
-        # assert (
-        #     capacity > 0 and capacity & (capacity - 1) == 0
-        # ), "capacity must be positive and a power of 2."
+        assert (
+            capacity > 0 and capacity & (capacity - 1) == 0
+        ), "capacity must be positive and a power of 2."
         self.capacity = capacity
         self.tree = np.full(2 * capacity, init_value, dtype=np.float32)  # 使用 NumPy 陣列
         self.operation = operation
@@ -178,7 +178,7 @@ class SegmentTree:
 
     def __getitem__(self, idx: int) -> float:
         """Get real value in leaf node of tree."""
-        # assert 0 <= idx < self.capacity
+        assert 0 <= idx < self.capacity
         return self.tree[self.capacity + idx]
 
 class SumSegmentTree(SegmentTree):
@@ -195,7 +195,7 @@ class SumSegmentTree(SegmentTree):
     def retrieve(self, upperbound: float) -> int:
         """Find the highest index `i` about upper bound in the tree."""
         total_sum = self.sum()
-        # assert 0 <= upperbound <= total_sum + 1e-5, f"upperbound: {upperbound}, total_sum: {total_sum}"
+        assert 0 <= upperbound <= total_sum + 1e-5, f"upperbound: {upperbound}, total_sum: {total_sum}"
         return _retrieve_sum(self.tree, upperbound, self.capacity)
 
     def batch_update(self, indices: np.ndarray, values: np.ndarray):

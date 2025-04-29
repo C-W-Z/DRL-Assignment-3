@@ -6,6 +6,19 @@ import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 import numpy as np
 
+class RandomStartEnv(gym.Wrapper):
+    def __init__(self, env, random_steps=4):
+        gym.Wrapper.__init__(self, env)
+        self.random_steps = random_steps
+
+    def reset(self):
+        obs = self.env.reset()
+        for _ in range(self.random_steps):
+            obs, _, done, _ = self.env.step(np.random.randint(len(COMPLEX_MOVEMENT)))
+            if done:
+                obs = self.env.reset()
+        return obs
+
 class SkipAndMax(gym.Wrapper):
     def __init__(self, env, skip=4):
         super().__init__(env)
@@ -94,14 +107,16 @@ class FrameStack(gym.Wrapper):
         self.frames[-1] = obs
         return self.frames, reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, max_episode_steps=3000, life_episode=True):
+def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode=True, random_start=True):
     env = gym_super_mario_bros.make('SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
+    if random_start:
+        env = RandomStartEnv(env)
     env = SkipAndMax(env, skip=skip_frames)
     if life_episode:
         env = LifeEpisode(env)
     env = FrameProcessing(env)
     env = FrameStack(env, n_steps=stack_frames)
-    if not life_episode:
+    if max_episode_steps:
         env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env
