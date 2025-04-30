@@ -60,7 +60,9 @@ class LifeEpisode(gym.Wrapper):
         if self.real_done:
             obs = self.env.reset()
         else:
-            obs, _, _, _ = self.env.step(0)
+            obs, _, done, _ = self.env.step(0)
+            # if done:
+            #     obs = self.env.reset()
         self.lives = getattr(self.env.unwrapped, '_life', 2)
         return obs
 
@@ -108,13 +110,13 @@ class FrameStack(gym.Wrapper):
         return self.frames, reward, done, info
 
 def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode=True, random_start=True):
-    env = gym_super_mario_bros.make('SuperMarioBros-v0')
+    env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     if random_start:
-        env = RandomStartEnv(env)
+        env = RandomStartEnv(env, random_steps=4)
     env = SkipAndMax(env, skip=skip_frames)
-    if life_episode:
-        env = LifeEpisode(env)
+    # if life_episode:
+    #     env = LifeEpisode(env)
     env = FrameProcessing(env)
     env = FrameStack(env, n_steps=stack_frames)
     if max_episode_steps:

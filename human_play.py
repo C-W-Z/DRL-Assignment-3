@@ -143,7 +143,7 @@ pygame.display.set_caption("Super Mario Bros")
 clock = pygame.time.Clock()
 
 # 初始化環境並應用wrapper
-env = gym_super_mario_bros.make('SuperMarioBros-v0')
+env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
 env = JoypadSpace(env, COMPLEX_MOVEMENT)
 env = SkipAndMax(env, skip=4)
 env = Frame_Processing(env)
@@ -216,13 +216,14 @@ env.close()
 pygame.quit()
 
 print(total_reward)
+print(len(trajectory))
 
 play = {
     'trajectory': trajectory,
     'total_reward': total_reward,
 }
-
-path = "./human_play/play_44.pkl"
+i = 49
+path = f"./human_play/play_{i}.pkl"
 with open(path, 'wb') as f:
     pickle.dump(play, f)
 print(f"trajectory saved to {path}")

@@ -30,7 +30,7 @@ TAU                     = 0.25
 LEARNING_RATE           = 0.000025
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
-EXPLORE_TAU             = 1.0
+EXPLORE_TAU             = 1.1
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -361,7 +361,8 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
 def learn_human_play(agent: Agent):
     import pickle
 
-    ids = [40, 41, 42, 43, 44]
+    # ids = [40, 41, 42, 43, 44]
+    ids = [45, 46, 47, 48]
 
     for id in ids:
         path = f"./human_play/play_{id}.pkl"
@@ -415,7 +416,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     last_x_pos = 0
     stage = 0
 
-    def process(episode, count_truncated = 0):
+    def process(episode, count_truncated = 0, last_x_pos = 0):
         # Logging
         if episode % PLOT_INTERVAL == 0:
             avg_reward = np.mean(
@@ -428,7 +429,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
                 if len(agent.custom_rewards) >= PLOT_INTERVAL
                 else agent.custom_rewards
             )
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated} | X {last_x_pos}")
             count_truncated = 0
 
         # Evaluation
@@ -448,15 +449,15 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     for episode in range(start_episode, num_episodes + 1):
 
         # Don't start from checkpoint in the middle of stage 1
-        if stage == 1 and episode % 3 != 1 and last_x_pos >= 1320:
-            if episode % 3 == 0:
-                last_x_pos = 0
-            agent.rewards.append(0)
-            agent.custom_rewards.append(0)
-            tqdm.write(f"Episode {episode}\t| Skip")
-            process(episode, count_truncated)
-            env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, True)
-            continue
+        # if stage == 1 and episode % 3 != 1 and last_x_pos >= 1320:
+        #     if episode % 3 == 0:
+        #         last_x_pos = 0
+        #         env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, True)
+        #     agent.rewards.append(0)
+        #     agent.custom_rewards.append(0)
+        #     tqdm.write(f"Episode {episode}\t| Skip")
+        #     process(episode, count_truncated, last_x_pos)
+        #     continue
 
         state = env.reset()
         episode_reward        = 0
@@ -475,6 +476,8 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
+
+            env.render()
 
             if not done:
                 last_x_pos = info['x_pos']
@@ -541,7 +544,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         # Logging
         tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}")
 
-        process(episode, count_truncated)
+        process(episode, count_truncated, last_x_pos)
 
         if agent.frame_idx >= MAX_FRAMES:
             break
@@ -550,4 +553,9 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     env.close()
 
 if __name__ == '__main__':
+    # EXPLORE_TAU = 2.0
+    # train(num_episodes=90)
+    # EXPLORE_TAU = 1.5
+    # train(num_episodes=300)
+    EXPLORE_TAU = 1.0
     train(num_episodes=10000)
