@@ -20,8 +20,8 @@ from per import PrioritizedReplayBuffer
 # Hyperparameters
 # -----------------------------
 RENDER                  = True
-DETERMINISTIC_X         = 200
-CONSTRAINT_STEPS        = 2
+DETERMINISTIC_X         = 0
+CONSTRAINT_STEPS        = 5
 
 # Env Wrappers
 SKIP_FRAMES             = 4
@@ -31,10 +31,10 @@ MAX_EPISODE_STEPS       = None
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 0.00005
+LEARNING_RATE           = 0.000025
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
-EXPLORE_TAU             = 1.0
+EXPLORE_TAU             = 1.2
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -51,11 +51,11 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 # Customized Reward
 VELOCITY_REWARD         = 0
 BACKWARD_PENALTY        = 0
-TRUNCATE_PENALTY        = 0
-STUCK_PENALTY           = -0.5
-STUCK_PENALTY_STEP      = 10
-STUCK_TRUNCATE_STEP     = None
-DEATH_PENALTY           = -10
+TRUNCATE_PENALTY        = -100
+STUCK_PENALTY           = -0.25
+STUCK_PENALTY_STEP      = 30
+STUCK_TRUNCATE_STEP     = 300
+DEATH_PENALTY           = -35
 UP_DOWN_PENALTY         = -10
 LEFT_PENALTY            = -1
 
@@ -161,7 +161,7 @@ class Agent:
         self.is_restricted = False
         self.restrict_count = 0
 
-    def act(self, state, deterministic=False, constrainted_step=3, restricted_actions:list=[2,4]):
+    def act(self, state, deterministic=False, constraint_steps=CONSTRAINT_STEPS, restricted_actions:list=[2,4]):
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
 
         # Define action mask
@@ -171,7 +171,9 @@ class Agent:
             action_mask[restricted_actions] = 1.0
         else:
             # Allow all actions
-            action_mask = torch.ones(self.n_actions, device=self.device)
+            # action_mask = torch.ones(self.n_actions, device=self.device)
+            action_mask = torch.zeros(self.n_actions, device=self.device)
+            action_mask[[0,1,2,3,4,5]] = 1.0
 
         with torch.no_grad():
             q_values = self.online(state_tensor)  # Shape: (1, n_actions)
@@ -190,10 +192,10 @@ class Agent:
                 action = torch.multinomial(probabilities, num_samples=1).item()
 
         # Update constraint state
-        if not self.is_restricted and action in self.jump_actions:
+        if constraint_steps > 0 and not self.is_restricted and action in self.jump_actions:
             # Activate restriction for next 3 actions
             self.is_restricted = True
-            self.restrict_count = constrainted_step
+            self.restrict_count = constraint_steps
         elif self.is_restricted:
             # Decrement counter and deactivate if done
             self.restrict_count -= 1
@@ -337,7 +339,7 @@ class Agent:
 # Training Loop
 # -----------------------------
 def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(15, 15))
+    plt.figure(figsize=(20, 15))
 
     plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
@@ -367,7 +369,7 @@ def plot_figure(agent: Agent, episode: int):
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(0.9 * len(agent.dqn_losses)):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
+    plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(len(agent.dqn_losses) // 2):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
     # plt.legend()
 
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
@@ -521,7 +523,10 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.frame_idx += 1
             steps += 1
 
-            action = agent.act(state, last_x_pos <= DETERMINISTIC_X)
+            action = agent.act(state,
+                               last_x_pos <= DETERMINISTIC_X or episode % EVAL_INTERVAL == 0,
+                               5 if prev_x and 310 <= prev_x <= 1100 else 2
+                               )
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
@@ -556,9 +561,9 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
             if stuck_steps >= STUCK_PENALTY_STEP:
                 custom_reward += STUCK_PENALTY
-            # if stuck_steps >= STUCK_TRUNCATE_STEP:
-            #     truncated = True
-            #     done = True
+            if stuck_steps >= STUCK_TRUNCATE_STEP:
+                truncated = True
+                done = True
 
             if dx < 0:
                 custom_reward += BACKWARD_PENALTY
@@ -568,8 +573,8 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             # if v >= 3.0:
             #     custom_reward += VELOCITY_REWARD * v
 
-            # if truncated:
-            #     custom_reward += TRUNCATE_PENALTY
+            if truncated:
+                custom_reward += TRUNCATE_PENALTY
 
             # custom_reward = np.sign(custom_reward) * (np.sqrt(np.abs(custom_reward) + 1) - 1) + custom_reward / 12.0
 
