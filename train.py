@@ -27,7 +27,7 @@ MAX_EPISODE_STEPS       = None
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 0.00001
+LEARNING_RATE           = 0.000025
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
 EXPLORE_TAU             = 1.0
@@ -412,25 +412,53 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
     count_truncated = 0
 
-    x_pos = 0
+    last_x_pos = 0
     stage = 0
-    level1_half_env = None
-    # level1_half_state = None
+
+    def process(episode, count_truncated = 0):
+        # Logging
+        if episode % PLOT_INTERVAL == 0:
+            avg_reward = np.mean(
+                agent.rewards[-PLOT_INTERVAL:]
+                if len(agent.rewards) >= PLOT_INTERVAL
+                else agent.rewards
+            )
+            avg_custom_reward = np.mean(
+                agent.custom_rewards[-PLOT_INTERVAL:]
+                if len(agent.custom_rewards) >= PLOT_INTERVAL
+                else agent.custom_rewards
+            )
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
+            count_truncated = 0
+
+        # Evaluation
+        if episode % EVAL_INTERVAL == 0:
+            evaluation(agent, episode, best_checkpoint_path)
+            agent.online.train()
+
+        # Plot
+        if episode % PLOT_INTERVAL == 0:
+            plot_figure(agent, episode)
+
+        # Save model
+        if episode % SAVE_INTERVAL == 0:
+            agent.save_model(checkpoint_path)
+            tqdm.write(f"Model saved at episode {episode}")
 
     for episode in range(start_episode, num_episodes + 1):
-        if level1_half_env != None:
-            env = copy.deepcopy(level1_half_env)
-            state = env.reset()
-            import cv2
-            cv2.imwrite("Level1Halfenv.jpg", np.asarray(state[0] * 255.0).astype(np.uint8))
-        else:
-            state = env.reset()
-        if level1_half_env == None and stage == 1 and episode % 3 != 1:
-            if x_pos >= 1320:
-                level1_half_env = copy.deepcopy(env)
-                # level1_half_state = state.copy()
-                tqdm.write("Get Level 1 Half env")
 
+        # Don't start from checkpoint in the middle of stage 1
+        if stage == 1 and episode % 3 != 1 and last_x_pos >= 1320:
+            if episode % 3 == 0:
+                last_x_pos = 0
+            agent.rewards.append(0)
+            agent.custom_rewards.append(0)
+            tqdm.write(f"Episode {episode}\t| Skip")
+            process(episode, count_truncated)
+            env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, True)
+            continue
+
+        state = env.reset()
         episode_reward        = 0
         episode_custom_reward = 0
         steps                 = 0
@@ -448,12 +476,14 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
 
+            if not done:
+                last_x_pos = info['x_pos']
+            stage = info['stage']
+
             # Reward Shaping
             custom_reward = reward
 
-            if not done:
-                x_pos = info['x_pos']
-            stage = info['stage']
+            # x_pos = info['x_pos']
             # if prev_x is None:
             #     prev_x = x_pos
             # dx = x_pos - prev_x
@@ -511,26 +541,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         # Logging
         tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}")
 
-        # Logging
-        if episode % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:] if len(agent.rewards) >= PLOT_INTERVAL else agent.rewards)
-            avg_custom_reward = np.mean(agent.custom_rewards[-PLOT_INTERVAL:] if len(agent.custom_rewards) >= PLOT_INTERVAL else agent.custom_rewards)
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
-            count_truncated = 0
-
-        # Evaluation
-        if episode % EVAL_INTERVAL == 0:
-            evaluation(agent, episode, best_checkpoint_path)
-            agent.online.train()
-
-        # Plot
-        if episode % PLOT_INTERVAL == 0:
-            plot_figure(agent, episode)
-
-        # Save model
-        if episode % SAVE_INTERVAL == 0:
-            agent.save_model(checkpoint_path)
-            tqdm.write(f"Model saved at episode {episode}")
+        process(episode, count_truncated)
 
         if agent.frame_idx >= MAX_FRAMES:
             break
