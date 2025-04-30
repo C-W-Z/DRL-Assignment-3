@@ -19,6 +19,10 @@ from per import PrioritizedReplayBuffer
 # -----------------------------
 # Hyperparameters
 # -----------------------------
+RENDER                  = True
+DETERMINISTIC_X         = 200
+CONSTRAINT_STEPS        = 2
+
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
@@ -27,10 +31,10 @@ MAX_EPISODE_STEPS       = None
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 0.000025
+LEARNING_RATE           = 0.00005
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
-EXPLORE_TAU             = 1.1
+EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -48,9 +52,12 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 VELOCITY_REWARD         = 0
 BACKWARD_PENALTY        = 0
 TRUNCATE_PENALTY        = 0
-STUCK_PENALTY           = 0
-STUCK_PENALTY_STEP      = None
+STUCK_PENALTY           = -0.5
+STUCK_PENALTY_STEP      = 10
 STUCK_TRUNCATE_STEP     = None
+DEATH_PENALTY           = -10
+UP_DOWN_PENALTY         = -10
+LEFT_PENALTY            = -1
 
 # Output
 EVAL_INTERVAL           = 30
@@ -144,19 +151,57 @@ class Agent:
         self.eval_rewards      = []
         self.best_eval_reward  = -np.inf
 
-    def act(self, state):
+        # Action constraint state
+        self.jump_actions = {2, 4, 5}  # Restricted action set
+        self.is_restricted = False  # Whether action constraint is active
+        self.restrict_count = 0  # Number of remaining restricted actions
+
+    def reset_action_constraint(self):
+        """Reset action constraint at the start of an episode."""
+        self.is_restricted = False
+        self.restrict_count = 0
+
+    def act(self, state, deterministic=False, constrainted_step=3, restricted_actions:list=[2,4]):
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
-        if not self.online.training:
-            with torch.no_grad():
-                q_value = self.online(state_tensor)
-            return int(q_value.argmax(dim=1).item())
+
+        # Define action mask
+        if self.is_restricted:
+            # Only allow actions 2, 4, 6
+            action_mask = torch.zeros(self.n_actions, device=self.device)
+            action_mask[restricted_actions] = 1.0
         else:
-            # Boltzmann Exploration
-            with torch.no_grad():
-                q_values = self.online(state_tensor) / EXPLORE_TAU  # a high tau means more randomness
-                probabilities = F.softmax(q_values, dim=1)
+            # Allow all actions
+            action_mask = torch.ones(self.n_actions, device=self.device)
+
+        with torch.no_grad():
+            q_values = self.online(state_tensor)  # Shape: (1, n_actions)
+
+            if not self.online.training or deterministic:
+                # Greedy selection (evaluation mode)
+                # Mask Q-values for invalid actions
+                # masked_q_values = q_values + (action_mask - 1) * 1e9  # Large negative for masked actions
+                # action = masked_q_values.argmax(dim=1).item()
+                return int(q_values.argmax(dim=1).item())
+            else:
+                # Boltzmann exploration (training mode)
+                # Apply mask to Q-values before softmax
+                masked_q_values = q_values / EXPLORE_TAU + (action_mask - 1) * 1e9
+                probabilities = F.softmax(masked_q_values, dim=1)
                 action = torch.multinomial(probabilities, num_samples=1).item()
-                return action
+
+        # Update constraint state
+        if not self.is_restricted and action in self.jump_actions:
+            # Activate restriction for next 3 actions
+            self.is_restricted = True
+            self.restrict_count = constrainted_step
+        elif self.is_restricted:
+            # Decrement counter and deactivate if done
+            self.restrict_count -= 1
+            if self.restrict_count <= 0:
+                self.is_restricted = False
+                self.restrict_count = 0
+
+        return action
 
     def check_parameters(self):
         """檢查 online、target 模塊的參數值大小"""
@@ -341,8 +386,10 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
             eval_reward = 0
             done = False
             while not done:
-                e_action = agent.act(state)
+                e_action = agent.act(state, True)
                 state, reward, done, _ = eval_env.step(e_action)
+                if RENDER:
+                    eval_env.render()
                 eval_reward += reward
             eval_rewards[i] = eval_reward
         eval_env.close()
@@ -414,7 +461,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     count_truncated = 0
 
     last_x_pos = 0
-    stage = 0
+    # stage = 0
 
     def process(episode, count_truncated = 0, last_x_pos = 0):
         # Logging
@@ -429,7 +476,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
                 if len(agent.custom_rewards) >= PLOT_INTERVAL
                 else agent.custom_rewards
             )
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated} | X {last_x_pos}")
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
             count_truncated = 0
 
         # Evaluation
@@ -459,12 +506,14 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         #     process(episode, count_truncated, last_x_pos)
         #     continue
 
+        agent.reset_action_constraint()
+
         state = env.reset()
         episode_reward        = 0
         episode_custom_reward = 0
         steps                 = 0
-        # stuck_steps           = 0
-        # prev_x                = None
+        stuck_steps           = 0
+        prev_x                = None
         done                  = False
         truncated             = False
 
@@ -472,12 +521,13 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.frame_idx += 1
             steps += 1
 
-            action = agent.act(state)
+            action = agent.act(state, last_x_pos <= DETERMINISTIC_X)
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
 
-            env.render()
+            if RENDER:
+                env.render()
 
             if not done:
                 last_x_pos = info['x_pos']
@@ -486,25 +536,32 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             # Reward Shaping
             custom_reward = reward
 
-            # x_pos = info['x_pos']
-            # if prev_x is None:
-            #     prev_x = x_pos
-            # dx = x_pos - prev_x
-            # prev_x = x_pos
+            if action >= 10:
+                custom_reward += UP_DOWN_PENALTY
+            elif action > 5:
+                custom_reward += LEFT_PENALTY
 
-            # if dx <= 1:
-            #     stuck_steps += 1
-            # else:
-            #     stuck_steps = 0
+            if done and not info['flag_get']:
+                custom_reward += DEATH_PENALTY
+            x_pos = info['x_pos']
+            if prev_x is None:
+                prev_x = x_pos
+            dx = x_pos - prev_x
+            prev_x = x_pos
 
-            # if stuck_steps >= STUCK_PENALTY_STEP:
-            #     custom_reward += STUCK_PENALTY
+            if dx <= 1:
+                stuck_steps += 1
+            else:
+                stuck_steps = 0
+
+            if stuck_steps >= STUCK_PENALTY_STEP:
+                custom_reward += STUCK_PENALTY
             # if stuck_steps >= STUCK_TRUNCATE_STEP:
             #     truncated = True
             #     done = True
 
-            # if dx < 0:
-            #     custom_reward += BACKWARD_PENALTY
+            if dx < 0:
+                custom_reward += BACKWARD_PENALTY
             # else:
             #     custom_reward += VELOCITY_REWARD * dx
             # v = episode_reward / steps
@@ -542,7 +599,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.check_gradients()
 
         # Logging
-        tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated}")
+        tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated} | X {last_x_pos}")
 
         process(episode, count_truncated, last_x_pos)
 
@@ -553,9 +610,4 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     env.close()
 
 if __name__ == '__main__':
-    # EXPLORE_TAU = 2.0
-    # train(num_episodes=90)
-    # EXPLORE_TAU = 1.5
-    # train(num_episodes=300)
-    EXPLORE_TAU = 1.0
     train(num_episodes=10000)
