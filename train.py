@@ -1,5 +1,5 @@
 import os
-from collections import deque, namedtuple
+# from collections import deque, namedtuple
 from typing import Dict, List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,9 +12,9 @@ from tqdm import tqdm
 from numba import njit
 
 from env_wrapper import make_env
-from segment_tree import SumSegmentTree, MinSegmentTree, _sample_core
+from per import PrioritizedReplayBuffer
 
-Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'done'])
+# Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state', 'done'])
 
 # -----------------------------
 # Hyperparameters
@@ -110,128 +110,8 @@ class D3QN(nn.Module):
 # Prioritized Replay Buffer
 # -----------------------------
 @njit
-def _compute_n_step_return(
-    rewards: np.ndarray,
-    dones: np.ndarray,
-    last_next_state: np.ndarray,
-    last_done: float,
-    gamma: float
-) -> Tuple[float, np.ndarray, float]:
-    reward = rewards[-1]
-    next_state = last_next_state
-    done = last_done
-    for i in range(len(rewards) - 2, -1, -1):
-        r = rewards[i]
-        d = dones[i]
-        reward = r + gamma * reward * (1 - d)
-        if d:
-            next_state = last_next_state
-            done = d
-    return reward, next_state, done
-
-@njit
 def _get_beta_by_frame(frame_idx):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
-
-class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape: Tuple):
-        self.obs_shape    = obs_shape
-        self.obs_buf      = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
-        self.next_obs_buf = np.zeros((MEMORY_SIZE,) + obs_shape, dtype=np.float32)
-        self.acts_buf     = np.zeros((MEMORY_SIZE,), dtype=np.int32)
-        self.rews_buf     = np.zeros((MEMORY_SIZE,), dtype=np.float32)
-        self.done_buf     = np.zeros((MEMORY_SIZE,), dtype=np.float32)
-        self.size = 0
-        self.ptr  = 0
-        self.n_step_buffer = deque(maxlen=N_STEP)
-        self.max_priority = 1.0
-        tree_capacity = 1
-        while tree_capacity < MEMORY_SIZE:
-            tree_capacity <<= 1 # *= 2
-        self.sum_tree = SumSegmentTree(tree_capacity)
-        self.min_tree = MinSegmentTree(tree_capacity)
-
-    def store(self, state, action, reward, next_state, done):
-        self.n_step_buffer.append(Transition(state, action, reward, next_state, done))
-        if len(self.n_step_buffer) < N_STEP:
-            return
-        reward_n, next_state_n, done_n = self._get_n_step()
-        self.obs_buf[self.ptr]       = self.n_step_buffer[0].state
-        self.acts_buf[self.ptr]      = self.n_step_buffer[0].action
-        self.rews_buf[self.ptr]      = reward_n
-        self.next_obs_buf[self.ptr]  = next_state_n
-        self.done_buf[self.ptr]      = done_n
-        self.sum_tree[self.ptr]      = self.max_priority ** ALPHA
-        self.min_tree[self.ptr]      = self.max_priority ** ALPHA
-        self.ptr                     = (self.ptr + 1) % MEMORY_SIZE
-        self.size                    = min(self.size + 1, MEMORY_SIZE)
-
-    def _get_n_step(self):
-        # 提取 n_step_buffer 的資料為 NumPy 陣列
-        rewards         = np.array([trans.reward for trans in self.n_step_buffer], dtype=np.float32)
-        dones           = np.array([trans.done for trans in self.n_step_buffer], dtype=np.float32)
-        last_next_state = self.n_step_buffer[-1].next_state
-        last_done       = float(self.n_step_buffer[-1].done)
-        # 用 numba 加速計算
-        reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, GAMMA)
-        return reward, next_state, done
-
-    def sample(self, frame_idx: int):
-        if self.size < BATCH_SIZE:
-            return None
-        indices, weights = _sample_core(
-            sum_tree   = self.sum_tree.tree,
-            min_tree   = self.min_tree.tree,
-            size       = self.size,
-            batch_size = BATCH_SIZE,
-            beta       = _get_beta_by_frame(frame_idx),
-            capacity   = self.sum_tree.capacity
-        )
-        batch = Transition(
-            state      = self.obs_buf[indices],
-            action     = self.acts_buf[indices],
-            reward     = self.rews_buf[indices],
-            next_state = self.next_obs_buf[indices],
-            done       = self.done_buf[indices]
-        )
-        return batch, weights, indices
-
-    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
-        priorities = np.maximum(priorities, PRIOR_EPS)
-        priorities_alpha = priorities ** ALPHA
-        indices = np.asarray(indices, dtype=np.int32)
-        # 直接調用 segment_tree 中的 batch_update 方法
-        self.sum_tree.batch_update(indices, priorities_alpha)
-        self.min_tree.batch_update(indices, priorities_alpha)
-        self.max_priority = max(self.max_priority, np.max(priorities))
-
-    def get_state(self):
-        return {
-            'obs_buf'      : self.obs_buf,
-            'next_obs_buf' : self.next_obs_buf,
-            'acts_buf'     : self.acts_buf,
-            'rews_buf'     : self.rews_buf,
-            'done_buf'     : self.done_buf,
-            'ptr'          : self.ptr,
-            'size'         : self.size,
-            'n_step_buffer': list(self.n_step_buffer),
-            'sum_tree'     : self.sum_tree.tree,
-            'min_tree'     : self.min_tree.tree,
-            'max_priority' : self.max_priority,
-        }
-
-    def set_state(self, state):
-        self.obs_buf       = state['obs_buf']
-        self.next_obs_buf  = state['next_obs_buf']
-        self.acts_buf      = state['acts_buf']
-        self.rews_buf      = state['rews_buf']
-        self.done_buf      = state['done_buf']
-        self.ptr           = state['ptr']
-        self.size          = state['size']
-        self.n_step_buffer = deque(state['n_step_buffer'], maxlen=N_STEP)
-        self.sum_tree.tree = state['sum_tree']
-        self.min_tree.tree = state['min_tree']
-        self.max_priority  = state['max_priority']
 
 # -----------------------------
 # Agent
@@ -248,7 +128,7 @@ class Agent:
 
         self.optimizer = optim.Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
-        self.buffer = PrioritizedReplayBuffer(obs_shape)
+        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA)
 
         # 初始化損失函數
         self.dqn_criterion         = nn.MSELoss(reduction='none')  # 用於 DQN Loss，逐元素計算
@@ -338,13 +218,14 @@ class Agent:
                 print(stat)
 
     def learn(self):
-        batch, weights, indices = self.buffer.sample(self.frame_idx)
-        states      = torch.tensor(batch.state, dtype=torch.float32, device=self.device)
-        actions     = torch.tensor(batch.action, dtype=torch.int64, device=self.device)
-        rewards     = torch.tensor(batch.reward, dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(batch.next_state, dtype=torch.float32, device=self.device)
-        dones       = torch.tensor(batch.done, dtype=torch.float32, device=self.device)
-        weights     = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        batch       = self.buffer.sample_batch(_get_beta_by_frame(self.frame_idx))
+        states      = torch.tensor(batch['obs'], dtype=torch.float32, device=self.device)
+        actions     = torch.tensor(batch['acts'], dtype=torch.int64, device=self.device)
+        rewards     = torch.tensor(batch['rews'], dtype=torch.float32, device=self.device)
+        next_states = torch.tensor(batch['next_obs'], dtype=torch.float32, device=self.device)
+        dones       = torch.tensor(batch['done'], dtype=torch.float32, device=self.device)
+        weights     = torch.tensor(batch['weights'], dtype=torch.float32, device=self.device)
+        indices     = batch['indices']
 
         # ------- DQN --------
         with torch.no_grad():
