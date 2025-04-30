@@ -25,10 +25,12 @@ STACK_FRAMES            = 4
 MAX_EPISODE_STEPS       = None
 
 # Agent
-TARGET_UPDATE           = 5000
-TAU                     = 0.5
-LEARNING_RATE           = 0.000025
+TARGET_UPDATE           = 1000
+TAU                     = 0.25
+LEARNING_RATE           = 0.00001
 ADAM_EPS                = 0.00015
+# Boltzmann Exploration
+EXPLORE_TAU             = 0.9
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -37,7 +39,7 @@ GAMMA                   = 0.99
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
-BETA_FRAMES             = 2000000
+BETA_FRAMES             = 1000000
 MAX_FRAMES              = 2000000
 PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
@@ -128,7 +130,7 @@ class Agent:
 
         self.optimizer = optim.Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
 
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA)
+        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
         # 初始化損失函數
         self.dqn_criterion         = nn.MSELoss(reduction='none')  # 用於 DQN Loss，逐元素計算
@@ -151,7 +153,7 @@ class Agent:
         else:
             # Boltzmann Exploration
             with torch.no_grad():
-                q_values = self.online(state_tensor) / 1  # a high tau means more randomness
+                q_values = self.online(state_tensor) / EXPLORE_TAU  # a high tau means more randomness
                 probabilities = F.softmax(q_values, dim=1)
                 action = torch.multinomial(probabilities, num_samples=1).item()
                 return action

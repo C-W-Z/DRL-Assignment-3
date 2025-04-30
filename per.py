@@ -122,6 +122,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         alpha: float = 0.6,
         n_step: int = 1,
         gamma: float = 0.99,
+        prior_eps: float = 1e-6,
     ):
         """Initialization."""
         assert alpha >= 0
@@ -131,6 +132,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         )
         self.max_priority, self.tree_ptr = 1.0, 0
         self.alpha = alpha
+        self.prior_eps = prior_eps
 
         # capacity must be positive and a power of 2.
         tree_capacity = 1
@@ -186,8 +188,10 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         """Update priorities of sampled transitions."""
         assert len(indices) == len(priorities)
 
+        priorities = np.maximum(priorities, self.prior_eps)
+
         for idx, priority in zip(indices, priorities):
-            assert priority > 0
+            # assert priority > 0
             assert 0 <= idx < len(self)
 
             self.sum_tree[idx] = priority ** self.alpha
