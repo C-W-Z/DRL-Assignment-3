@@ -10,7 +10,7 @@ import torch.optim as optim
 import torch.nn.utils as U
 from tqdm import tqdm
 from numba import njit
-
+import copy
 from env_wrapper import make_env
 from per import PrioritizedReplayBuffer
 
@@ -30,7 +30,7 @@ TAU                     = 0.25
 LEARNING_RATE           = 0.00001
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
-EXPLORE_TAU             = 0.9
+EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -412,8 +412,25 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
     count_truncated = 0
 
+    x_pos = 0
+    stage = 0
+    level1_half_env = None
+    # level1_half_state = None
+
     for episode in range(start_episode, num_episodes + 1):
-        state                 = env.reset()
+        if level1_half_env != None:
+            env = copy.deepcopy(level1_half_env)
+            state = env.reset()
+            import cv2
+            cv2.imwrite("Level1Halfenv.jpg", np.asarray(state[0] * 255.0).astype(np.uint8))
+        else:
+            state = env.reset()
+        if level1_half_env == None and stage == 1 and episode % 3 != 1:
+            if x_pos >= 1320:
+                level1_half_env = copy.deepcopy(env)
+                # level1_half_state = state.copy()
+                tqdm.write("Get Level 1 Half env")
+
         episode_reward        = 0
         episode_custom_reward = 0
         steps                 = 0
@@ -434,7 +451,9 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             # Reward Shaping
             custom_reward = reward
 
-            # x_pos = info['x_pos']
+            if not done:
+                x_pos = info['x_pos']
+            stage = info['stage']
             # if prev_x is None:
             #     prev_x = x_pos
             # dx = x_pos - prev_x
