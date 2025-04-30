@@ -1,7 +1,7 @@
 from env_wrapper import make_env
 from train import Agent
 
-env = make_env(life_episode=True)
+env = make_env(life_episode=False, level='')
 
 agent = Agent(env.observation_space.shape, env.action_space.n)
 agent.load_model("./models/d3qn_per_bolzman.pth", eval_mode=True)
