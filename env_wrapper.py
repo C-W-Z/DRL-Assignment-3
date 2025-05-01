@@ -138,7 +138,7 @@ class FrameStack(gym.Wrapper):
         self.frames[-1] = obs
         return self.frames, reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=False, level='1-1'):
+def make_env(skip_frames=4, stack_frames=4, life_episode=True, level: str=None):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = NoopResetEnv(env)
@@ -152,7 +152,7 @@ def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=Fals
     return env
 
 if __name__ == "__main__":
-    env = make_env(life_episode=False, level='')
+    env = make_env(life_episode=False, level=None)
     print(f"observation_space.shape: {env.observation_space.shape}")
     obs = env.reset()
     assert obs.shape == env.observation_space.shape

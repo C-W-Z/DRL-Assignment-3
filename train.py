@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Tuple
+from typing import Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as U
 from torch.optim import Adam
-from tqdm import tqdm
 from numba import njit
 from env_wrapper import make_env
 from per import PrioritizedReplayBuffer
@@ -15,8 +14,7 @@ from per import PrioritizedReplayBuffer
 # -----------------------------
 # Hyperparameters
 # -----------------------------
-RENDER                  = True
-MAX_TRAINING_FRAMES     = 2000000
+RENDER                  = False
 
 # Env Wrappers
 SKIP_FRAMES             = 4
@@ -53,6 +51,13 @@ CHECK_PARAM_INTERVAL    = 150
 CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
+
+# -----------------------------
+# Prioritized Replay Buffer
+# -----------------------------
+@njit
+def _get_beta_by_frame(frame_idx: int):
+    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 # -----------------------------
 # Double Dueling Deep Recurrent Q Network
@@ -101,13 +106,6 @@ class D3QN(nn.Module):
         advantage = self.advantage_layer(x)
         q         = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
-
-# -----------------------------
-# Prioritized Replay Buffer
-# -----------------------------
-@njit
-def _get_beta_by_frame(frame_idx):
-    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
 # -----------------------------
 # Agent
@@ -317,7 +315,7 @@ def plot_figure(agent: Agent, episode: int):
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
-    tqdm.write(f"Plot saved to {save_path}")
+    print(f"Plot saved to {save_path}")
 
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
     agent.online.eval()
@@ -345,7 +343,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
         if total_eval_reward > agent.best_eval_reward:
             agent.best_eval_reward = total_eval_reward
 
-        tqdm.write(
+        print(
             f"Eval Reward: {eval_rewards[0]:.0f} + {eval_rewards[1]:.0f} + {eval_rewards[2]:.0f} = {total_eval_reward:.0f} | "
             f"Farest X {farest_x} | "
             f"Best Eval Reward: {agent.best_eval_reward:.0f}"
@@ -353,15 +351,23 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
 
         if total_eval_reward >= 3000 and total_eval_reward == agent.best_eval_reward:
             agent.save_model(best_checkpoint_path)
-            tqdm.write(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
+            print(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
 
     agent.online.train()
 
-def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
-    env = make_env(SKIP_FRAMES, STACK_FRAMES, False)
-    print(f"observation_space.shape: {env.observation_space.shape}")
+def train(
+    max_episodes: int,
+    level: str=None,
+    checkpoint_path='models/d3qn_per_bolzman.pth',
+    best_checkpoint_path='models/d3qn_per_bolzman_best.pth',
+    reset_epsilon=False
+):
+
+    env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False, level=level)
 
     agent = Agent(env.observation_space.shape, env.action_space.n)
+    if reset_epsilon:
+        agent.epsilon = EPSILON_START
 
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
@@ -383,11 +389,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         if done:
             state = env.reset()
 
-    # Training
-    progress_bar = tqdm(total=MAX_TRAINING_FRAMES, desc="Training")
-    progress_bar.update(len(agent.dqn_losses))
-
-    for episode in range(start_episode, num_episodes + 1):
+    for episode in range(start_episode, max_episodes + 1):
 
         state = env.reset()
         episode_reward  = 0
@@ -417,10 +419,6 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             dqn_loss = agent.learn()
             agent.dqn_losses.append(dqn_loss)
 
-            progress_bar.update(1)
-            if agent.frame_idx >= MAX_TRAINING_FRAMES:
-                break
-
         agent.rewards.append(episode_reward)
 
         # Check parameters
@@ -432,7 +430,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.check_gradients()
 
         # Logging
-        tqdm.write(
+        print(
             f"Episode {episode}\t| "
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
@@ -458,15 +456,13 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
                 if len(agent.rewards) >= SAVE_INTERVAL
                 else agent.rewards
             )
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | ")
+            print(f"Avg Reward {avg_reward:.1f} | ")
             agent.save_model(checkpoint_path)
-            tqdm.write(f"Model saved at episode {episode}")
+            print(f"Model saved at episode {episode}")
 
-        if agent.frame_idx >= MAX_TRAINING_FRAMES:
-            break
-
-    progress_bar.close()
     env.close()
 
 if __name__ == '__main__':
-    train(num_episodes=20000)
+    # train each level 3000 episodes
+    train(max_episodes=3000, level='1-1')
+    train(max_episodes=6000, level='1-2', reset_epsilon=True)
