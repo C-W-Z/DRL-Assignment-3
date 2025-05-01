@@ -99,7 +99,7 @@ class LifeEpisode(gym.Wrapper):
 class FrameProcessing(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(84, 84), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
 
     def observation(self, obs):
         return FrameProcessing.process(obs)
@@ -113,8 +113,9 @@ class FrameProcessing(gym.ObservationWrapper):
         # 縮放到 (110, 84)，然後裁剪
         frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
         frame = frame[18:102, :]  # (84, 84)
-        # 規範化到 [0.0, 1.0]
-        return frame.astype(np.float32) / 255.0
+        # 轉為 (1, 84, 84)，規範化到 [0.0, 1.0]
+        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
+        # assert frame.shape == (1, 84, 84)
 
 def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode=True, random_start=False, level='1-1'):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
@@ -125,8 +126,8 @@ def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode
     env = SkipAndMax(env, skip=skip_frames)
     if life_episode:
         env = LifeEpisode(env)
-    env = FrameProcessing(env) # (84, 84)
-    env = FrameStack(env, num_stack=stack_frames) # (4, 84, 84)
+    env = FrameProcessing(env) # (1, 84, 84)
+    env = FrameStack(env, num_stack=stack_frames) # (4, 1, 84, 84)
     # if max_episode_steps:
     #     env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env

@@ -26,8 +26,8 @@ STACK_FRAMES            = 4
 MAX_EPISODE_STEPS       = None
 
 # Agent
-TARGET_UPDATE           = 1000
-TAU                     = 0.25
+TARGET_UPDATE           = 10
+TAU                     = 0.005
 LEARNING_RATE           = 0.0005 # 0 lives: 2.5e-4, 1260 lives: 2e-4, 9540: 5e-4
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
@@ -37,7 +37,7 @@ DETERMINISTIC_X         = 0 # 開始0, 9270 lives以後800, 9360以後1200
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
 BATCH_SIZE              = 64
-GAMMA                   = 0.9
+GAMMA                   = 0.95
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
@@ -75,6 +75,7 @@ class D3QN(nn.Module):
         self.n_actions = n_actions
 
         self.feature_layer = nn.Sequential(
+            # Input: (BATCH_SIZE * 4, 1, 84, 84)
             nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2),
@@ -435,6 +436,8 @@ def learn_human_play(agent: Agent):
 
 def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
     env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, False)
+    print(f"observation_space.shape: {env.observation_space.shape}")
+
     agent = Agent(env.observation_space.shape, env.action_space.n)
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
     os.makedirs(PLOT_DIR, exist_ok=True)
