@@ -117,6 +117,28 @@ class FrameProcessing(gym.ObservationWrapper):
         return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
         # assert frame.shape == (1, 84, 84)
 
+class FrameStack(gym.Wrapper):
+    def __init__(self, env, n_steps=4):
+        super().__init__(env)
+        self.n_steps = n_steps
+        shp = env.observation_space.shape
+        self.observation_space = gym.spaces.Box(0, 1, shape=(n_steps * shp[0], shp[1], shp[2]), dtype=np.float32)
+        self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
+
+    def reset(self):
+        obs = self.env.reset()
+        obs = np.asarray(obs)
+        for i in range(self.n_steps):
+            self.frames[i] = obs
+        return self.frames
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        obs = np.asarray(obs)
+        self.frames[:-1] = self.frames[1:]
+        self.frames[-1] = obs
+        return self.frames, reward, done, info
+
 def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode=True, random_start=False, level='1-1'):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
@@ -127,7 +149,7 @@ def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode
     if life_episode:
         env = LifeEpisode(env)
     env = FrameProcessing(env) # (1, 84, 84)
-    env = FrameStack(env, num_stack=stack_frames) # (4, 1, 84, 84)
+    env = FrameStack(env, n_steps=stack_frames) # (4, 84, 84)
     # if max_episode_steps:
     #     env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env
