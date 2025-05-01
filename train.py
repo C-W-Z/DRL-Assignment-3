@@ -304,42 +304,44 @@ class Agent:
         return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 
     def save_model(self, path):
-        torch.save({
-            'online'           : self.online.state_dict(),
-            'target'           : self.target.state_dict(),
-            'icm'              : self.icm.state_dict(),
-            'optimizer'        : self.optimizer.state_dict(),
-            'epsilon'          : self.epsilon,
-            'frame_idx'        : self.frame_idx,
-            'rewards'          : self.rewards,
-            'dqn_losses'       : self.dqn_losses,
-            'forward_losses'   : self.forward_losses,
-            'inverse_losses'   : self.inverse_losses,
-            'intrinsic_rewards': self.intrinsic_rewards,
-            'eval_rewards'     : self.eval_rewards,
-            'best_eval_reward' : self.best_eval_reward,
-            'buffer_state'     : self.buffer.get_state(),
-        }, path, pickle_protocol=4)
+        # torch.save({
+        #     'online'           : self.online.state_dict(),
+        #     'target'           : self.target.state_dict(),
+        #     'icm'              : self.icm.state_dict(),
+        #     'optimizer'        : self.optimizer.state_dict(),
+        #     'epsilon'          : self.epsilon,
+        #     'frame_idx'        : self.frame_idx,
+        #     'rewards'          : self.rewards,
+        #     'dqn_losses'       : self.dqn_losses,
+        #     'forward_losses'   : self.forward_losses,
+        #     'inverse_losses'   : self.inverse_losses,
+        #     'intrinsic_rewards': self.intrinsic_rewards,
+        #     'eval_rewards'     : self.eval_rewards,
+        #     'best_eval_reward' : self.best_eval_reward,
+        #     'buffer_state'     : self.buffer.get_state(),
+        # }, path, pickle_protocol=4)
+        torch.save(self.online.state_dict(), path, pickle_protocol=4)
 
     def load_model(self, path, eval_mode=False):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.online.load_state_dict(checkpoint['online'])
-        if eval_mode:
-            self.online.eval()
-            return
-        self.target.load_state_dict(checkpoint['target'])
-        self.icm.load_state_dict(checkpoint['icm'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
-        self.frame_idx         = checkpoint.get('frame_idx', 0)
-        self.rewards           = checkpoint.get('rewards', [])
-        self.dqn_losses        = checkpoint.get('dqn_losses', [])
-        self.forward_losses    = checkpoint.get('forward_losses', [])
-        self.inverse_losses    = checkpoint.get('inverse_losses', [])
-        self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
-        self.eval_rewards      = checkpoint.get('eval_rewards', [])
-        self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
-        self.buffer.set_state(checkpoint['buffer_state'])
+        # self.online.load_state_dict(checkpoint['online'])
+        # if eval_mode:
+        #     self.online.eval()
+        #     return
+        # self.target.load_state_dict(checkpoint['target'])
+        # self.icm.load_state_dict(checkpoint['icm'])
+        # self.optimizer.load_state_dict(checkpoint['optimizer'])
+        # self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
+        # self.frame_idx         = checkpoint.get('frame_idx', 0)
+        # self.rewards           = checkpoint.get('rewards', [])
+        # self.dqn_losses        = checkpoint.get('dqn_losses', [])
+        # self.forward_losses    = checkpoint.get('forward_losses', [])
+        # self.inverse_losses    = checkpoint.get('inverse_losses', [])
+        # self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
+        # self.eval_rewards      = checkpoint.get('eval_rewards', [])
+        # self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
+        # self.buffer.set_state(checkpoint['buffer_state'])
+        self.online.load_state_dict(checkpoint)
 
 # ------- Training Functions -------
 

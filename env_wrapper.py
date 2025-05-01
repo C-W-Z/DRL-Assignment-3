@@ -110,8 +110,10 @@ class FrameProcessing(gym.ObservationWrapper):
         # 使用 OpenCV 轉灰度
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)  # (240, 256), uint8
         # 縮放到 (110, 84)，然後裁剪
-        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
-        frame = frame[18:102, :]  # (84, 84)
+        # frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
+        # frame = frame[18:102, :]  # (84, 84)
+        # 縮放到 (84, 84)
+        frame = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
         # 轉為 (1, 84, 84)，規範化到 [0.0, 1.0]
         return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
         # assert frame.shape == (1, 84, 84)
@@ -156,3 +158,4 @@ if __name__ == "__main__":
     print(f"observation_space.shape: {env.observation_space.shape}")
     obs = env.reset()
     assert obs.shape == env.observation_space.shape
+    cv2.imwrite("test2.jpg", (obs[0] * 255).astype(np.uint8))
