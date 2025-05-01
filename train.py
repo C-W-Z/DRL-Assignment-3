@@ -21,11 +21,11 @@ SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
 
 # DQN
-TARGET_UPDATE           = 5
-TAU                     = 0.001
-LEARNING_RATE           = 1e-4
-ADAM_EPS                = 0.00015
-WEIGHT_DECAY            = 1e-6
+TARGET_UPDATE_FRAMES    = 5
+TARGET_UPDATE_TAU       = 1e-3
+DQN_LEARNING_RATE       = 1e-4
+DQN_ADAM_EPS            = 1.5e-4
+DQN_WEIGHT_DECAY        = 1e-6
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
@@ -38,13 +38,13 @@ EPSILON                 = 0.1
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
-MEMORY_SIZE             = 50000
+MEMORY_SIZE             = 50_000
 BATCH_SIZE              = 64
 GAMMA                   = 0.95
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
-BETA_FRAMES             = 1000000
+BETA_FRAMES             = 2_000_000
 PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
@@ -160,11 +160,11 @@ def build_dqn_optimizer(model: nn.Module):
 
     optimizer = Adam(
         [
-            {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+            {"params": decay_params, "weight_decay": DQN_WEIGHT_DECAY},
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
-        lr=LEARNING_RATE,
-        eps=ADAM_EPS
+        lr=DQN_LEARNING_RATE,
+        eps=DQN_ADAM_EPS
     )
     return optimizer
 
@@ -180,9 +180,9 @@ class Agent:
 
         self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
 
-        # self.optimizer      = Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY)
+        # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
         self.optimizer      = build_dqn_optimizer(self.online)
-        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE, weight_decay=DQN_WEIGHT_DECAY)
 
         self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
@@ -320,14 +320,14 @@ class Agent:
 
         self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
-        if self.frame_idx % TARGET_UPDATE == 0:
-            if TAU == 1.0:
+        if self.frame_idx % TARGET_UPDATE_FRAMES == 0:
+            if TARGET_UPDATE_TAU == 1.0:
                 # Hard target update
                 self.target.load_state_dict(self.online.state_dict())
             else:
                 # Soft target update
                 for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
-                    target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
+                    target_param.data.copy_(TARGET_UPDATE_TAU * online_param.data + (1.0 - TARGET_UPDATE_TAU) * target_param.data)
 
         return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 

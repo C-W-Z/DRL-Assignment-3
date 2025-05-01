@@ -9,3 +9,4 @@ gym_super_mario_bros
 numba
 opencv-python
 matplotlib
+torchrl
