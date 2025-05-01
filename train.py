@@ -21,10 +21,16 @@ SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
 
 # DQN
-TARGET_UPDATE           = 10
-TAU                     = 0.005
+TARGET_UPDATE           = 5
+TAU                     = 0.001
 LEARNING_RATE           = 5e-4
 ADAM_EPS                = 0.00015
+
+# Intrinsic Curiosity Module
+ICM_BETA                = 0.2
+ICM_ETA                 = 1.0
+ICM_EMBED_DIM           = 512
+LAMBDA                  = 0.2
 
 # Epsilon Boltzmann Exploration
 EPSILON_START           = 1.0
@@ -33,7 +39,7 @@ EPSILON_DECAY           = 0.999
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
-MEMORY_SIZE             = 50000
+MEMORY_SIZE             = 100000
 BATCH_SIZE              = 64
 GAMMA                   = 0.95
 N_STEP                  = 5
@@ -45,23 +51,54 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
 EVAL_INTERVAL           = 30
-SAVE_INTERVAL           = 150
+SAVE_INTERVAL           = 300
 PLOT_INTERVAL           = 30
 CHECK_PARAM_INTERVAL    = 150
 CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
-# -----------------------------
-# Prioritized Replay Buffer
-# -----------------------------
+# ------- Prioritized Replay Buffer -------
+
 @njit
 def _get_beta_by_frame(frame_idx: int):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
-# -----------------------------
-# Double Dueling Deep Recurrent Q Network
-# -----------------------------
+# ------- Intrinsic Curiosity Module -------
+
+class ICM(nn.Module):
+    def __init__(self, feature_dimension: int, n_actions: int, embed_dimension: int=ICM_EMBED_DIM):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dimension, embed_dimension),
+            nn.ReLU(),
+        )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(embed_dimension * 2, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(embed_dimension + n_actions, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, embed_dimension)
+        )
+
+    def forward(self, features, next_features, actions):
+        phi           = self.encoder(features)
+        phi_next      = self.encoder(next_features)
+
+        inv_input     = torch.cat([phi, phi_next], dim=1)
+        pred_action   = self.inverse_model(inv_input)
+
+        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
+        forward_input = torch.cat([phi, action_onehot], dim=1)
+        pred_phi_next = self.forward_model(forward_input)
+
+        return pred_action, pred_phi_next, phi_next
+
+# ------- Double Dueling Deep Recurrent Q Network -------
+
 class D3QN(nn.Module):
     def __init__(self, in_channels: int, n_actions: int):
         super().__init__()
@@ -107,9 +144,8 @@ class D3QN(nn.Module):
         q         = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
 
-# -----------------------------
-# Agent
-# -----------------------------
+# ------- Agent -------
+
 class Agent:
     def __init__(self, obs_shape: Tuple, n_actions: int, device=None):
         self.device     = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -120,16 +156,23 @@ class Agent:
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
-        self.optimizer  = Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS)
+        self.icm        = ICM(self.online.feature_dimension, n_actions).to(self.device)
+
+        self.optimizer  = Adam(list(self.online.parameters()) + list(self.icm.parameters()), lr=LEARNING_RATE, eps=ADAM_EPS)
 
         self.buffer     = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
-        self.criterion  = nn.MSELoss(reduction='none')
+        self.dqn_criterion      = nn.MSELoss(reduction='none')
+        self.forward_criterion  = nn.MSELoss()
+        self.inverse_criterion  = nn.CrossEntropyLoss()
 
         self.epsilon           = EPSILON_START
         self.frame_idx         = 0
         self.rewards           = []
         self.dqn_losses        = []
+        self.forward_losses    = []
+        self.inverse_losses    = []
+        self.intrinsic_rewards = []
         self.eval_rewards      = []
         self.best_eval_reward  = -np.inf
 
@@ -151,6 +194,7 @@ class Agent:
         models = {
             "online": self.online,
             "target": self.target,
+            "icm": self.icm
         }
 
         max_len = len("advantage_layer.0.weight:")
@@ -182,6 +226,7 @@ class Agent:
         """檢查梯度大小"""
         models = {
             "online": self.online,
+            "icm": self.icm
         }
 
         max_len = len("advantage_layer.0.weight")
@@ -217,20 +262,32 @@ class Agent:
         weights     = torch.tensor(batch['weights'], dtype=torch.float32, device=self.device)
         indices     = batch['indices']
 
-        # ------- DQN --------
+        # ----- ICM -----
+        features        = self.online.feature_layer(states).detach()
+        next_features   = self.online.feature_layer(next_states).detach()
+        pred_action, pred_phi_next, phi_next = self.icm(features, next_features, actions)
+        inverse_loss    = self.inverse_criterion(pred_action, actions)
+        forward_loss    = self.forward_criterion(pred_phi_next, phi_next.detach())
+        icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
+        with torch.no_grad():
+            intrinsic_reward = ICM_ETA * forward_loss.detach()
+
+        # ----- DQN -----
         with torch.no_grad():
             next_actions = self.online(next_states).argmax(1)
             q_next       = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            q_target     = rewards + GAMMA_POW_N_STEP * q_next * (1 - dones)
+            q_target     = rewards + intrinsic_reward + GAMMA_POW_N_STEP * q_next * (1 - dones)
         q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
         td_value    = q_predicted - q_target.detach()
-        dqn_loss    = (self.criterion(q_predicted, q_target.detach()) * weights).mean()
+        dqn_loss    = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
 
-        # update DQN
+        # ----- Update -----
         self.optimizer.zero_grad()
-        dqn_loss.backward()
+        (LAMBDA * dqn_loss + icm_loss).backward()
         U.clip_grad_norm_(self.online.parameters(), 5.0)
+        U.clip_grad_norm_(self.icm.parameters(), 5.0)
         # U.clip_grad_value_(self.online.parameters(), 1.0)
+        # U.clip_grad_value_(self.icm.parameters(), 1.0)
         self.optimizer.step()
 
         self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
@@ -244,17 +301,21 @@ class Agent:
                 for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
                     target_param.data.copy_(TAU * online_param.data + (1.0 - TAU) * target_param.data)
 
-        return dqn_loss.item()
+        return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 
     def save_model(self, path):
         torch.save({
             'online'           : self.online.state_dict(),
             'target'           : self.target.state_dict(),
+            'icm'              : self.icm.state_dict(),
             'optimizer'        : self.optimizer.state_dict(),
             'epsilon'          : self.epsilon,
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
             'dqn_losses'       : self.dqn_losses,
+            'forward_losses'   : self.forward_losses,
+            'inverse_losses'   : self.inverse_losses,
+            'intrinsic_rewards': self.intrinsic_rewards,
             'eval_rewards'     : self.eval_rewards,
             'best_eval_reward' : self.best_eval_reward,
             'buffer_state'     : self.buffer.get_state(),
@@ -267,22 +328,25 @@ class Agent:
             self.online.eval()
             return
         self.target.load_state_dict(checkpoint['target'])
+        self.icm.load_state_dict(checkpoint['icm'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
         self.frame_idx         = checkpoint.get('frame_idx', 0)
         self.rewards           = checkpoint.get('rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
+        self.forward_losses    = checkpoint.get('forward_losses', [])
+        self.inverse_losses    = checkpoint.get('inverse_losses', [])
+        self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
         self.eval_rewards      = checkpoint.get('eval_rewards', [])
         self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
 
-# -----------------------------
-# Training Loop
-# -----------------------------
-def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(20, 15))
+# ------- Training Functions -------
 
-    plt.subplot(311)
+def plot_figure(agent: Agent, episode: int):
+    plt.figure(figsize=(24, 10))
+
+    plt.subplot(221)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Life {episode} | Avg Reward {avg_reward:.1f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
@@ -296,7 +360,7 @@ def plot_figure(agent: Agent, episode: int):
         arr = np.pad(arr, (0, 3 - len(arr) % 3))
     episode_rewards = arr.reshape(-1, 3).sum(axis=1)
 
-    plt.subplot(312)
+    plt.subplot(223)
     avg_reward = np.mean(episode_rewards[-PLOT_INTERVAL//3:]) if len(episode_rewards) >= PLOT_INTERVAL // 3 else np.mean(episode_rewards)
     plt.title(f"Episode {episode // 3} | Avg Reward {avg_reward:.1f}")
     plt.plot(1 + np.arange(len(episode_rewards)), episode_rewards, label='Reward')
@@ -305,12 +369,21 @@ def plot_figure(agent: Agent, episode: int):
     plt.ylim(bottom=max(-1000.0, min(min(episode_rewards), min(agent.eval_rewards))))
     plt.legend()
 
-    plt.subplot(313)
+    plt.subplot(222)
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
     plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(len(agent.dqn_losses) // 2):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
     # plt.legend()
+
+    plt.subplot(224)
+    plt.title(f"ICM Loss | Intrinsic Reward = {ICM_ETA:.1f} x Forward Loss")
+    plt.plot(agent.inverse_losses, label='Inverse Loss')
+    plt.plot(agent.forward_losses, label='Forward Loss')
+    plt.plot(agent.intrinsic_rewards, label='Intrinsic Reward')
+    plt.xlim(left=0.0, right=len(agent.inverse_losses))
+    plt.ylim(bottom=0.0)
+    plt.legend()
 
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
@@ -358,8 +431,8 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
 def train(
     max_episodes: int,
     level: str=None,
-    checkpoint_path='models/d3qn_per_bolzman.pth',
-    best_checkpoint_path='models/d3qn_per_bolzman_best.pth',
+    checkpoint_path='models/d3qn_icm_epsilonboltz.pth',
+    best_checkpoint_path='models/d3qn_icm_epsilonboltz_best.pth',
     reset_epsilon=False
 ):
 
@@ -416,8 +489,11 @@ def train(
             agent.buffer.store(state, action, reward, next_state, done)
             state = next_state
 
-            dqn_loss = agent.learn()
+            dqn_loss, forward_loss, inverse_loss, int_reward = agent.learn()
             agent.dqn_losses.append(dqn_loss)
+            agent.forward_losses.append(forward_loss)
+            agent.inverse_losses.append(inverse_loss)
+            agent.intrinsic_rewards.append(int_reward)
 
         agent.rewards.append(episode_reward)
 
