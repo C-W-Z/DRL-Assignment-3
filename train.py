@@ -7,10 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.utils as U
 from torch.optim import Adam
-from numba import njit
 from collections import deque
 from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
 from tensordict import TensorDict
+from tqdm import tqdm
 
 from env_wrapper import make_env
 
@@ -561,6 +561,9 @@ def train(
         if done:
             state = env.reset()
 
+    progress_bar = tqdm(total=10_000_000, desc="Training")
+    progress_bar.update(len(agent.dqn_losses))
+
     start_episode = len(agent.rewards) + 1
 
     for episode in range(start_episode, max_episodes + 1):
@@ -595,6 +598,10 @@ def train(
             agent.forward_losses.append(forward_loss)
             agent.inverse_losses.append(inverse_loss)
             agent.intrinsic_rewards.append(int_reward)
+
+            progress_bar.update(1)
+            if agent.frame_idx >= 10_000_000:
+                break
 
         agent.rewards.append(episode_reward)
 
@@ -635,6 +642,7 @@ def train(
             print(f"Model saved at episode {episode}")
 
     env.close()
+    progress_bar.close()
 
 if __name__ == '__main__':
     checkpoint_path='models/d3qn_icm_lv1.pth'
