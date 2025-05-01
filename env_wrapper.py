@@ -1,6 +1,5 @@
 import cv2
 import gym
-from gym.wrappers import FrameStack, TimeLimit
 from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
@@ -139,7 +138,7 @@ class FrameStack(gym.Wrapper):
         self.frames[-1] = obs
         return self.frames, reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode=True, random_start=False, level='1-1'):
+def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=False, level='1-1'):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     env = NoopResetEnv(env)
@@ -150,8 +149,6 @@ def make_env(skip_frames=4, stack_frames=4, max_episode_steps=None, life_episode
         env = LifeEpisode(env)
     env = FrameProcessing(env) # (1, 84, 84)
     env = FrameStack(env, n_steps=stack_frames) # (4, 84, 84)
-    # if max_episode_steps:
-    #     env = TimeLimit(env, max_episode_steps=max_episode_steps)
     return env
 
 if __name__ == "__main__":

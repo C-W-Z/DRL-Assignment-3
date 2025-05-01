@@ -21,7 +21,6 @@ MAX_TRAINING_FRAMES     = 2000000
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = None
 
 # DQN
 TARGET_UPDATE           = 10
@@ -45,17 +44,6 @@ BETA_START              = 0.4
 BETA_FRAMES             = 1000000
 PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
-
-# Customized Reward
-VELOCITY_REWARD         = 0
-BACKWARD_PENALTY        = 0
-TRUNCATE_PENALTY        = 0
-STUCK_PENALTY           = 0
-STUCK_PENALTY_STEP      = None
-STUCK_TRUNCATE_STEP     = None
-DEATH_PENALTY           = 0
-UP_DOWN_PENALTY         = 0
-LEFT_PENALTY            = 0
 
 # Output
 EVAL_INTERVAL           = 30
@@ -143,7 +131,6 @@ class Agent:
         self.epsilon           = EPSILON_START
         self.frame_idx         = 0
         self.rewards           = []
-        self.custom_rewards    = []
         self.dqn_losses        = []
         self.eval_rewards      = []
         self.best_eval_reward  = -np.inf
@@ -269,7 +256,6 @@ class Agent:
             'epsilon'          : self.epsilon,
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
-            'custom_rewards'   : self.custom_rewards,
             'dqn_losses'       : self.dqn_losses,
             'eval_rewards'     : self.eval_rewards,
             'best_eval_reward' : self.best_eval_reward,
@@ -287,7 +273,6 @@ class Agent:
         self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
         self.frame_idx         = checkpoint.get('frame_idx', 0)
         self.rewards           = checkpoint.get('rewards', [])
-        self.custom_rewards    = checkpoint.get('custom_rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
         self.eval_rewards      = checkpoint.get('eval_rewards', [])
         self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
@@ -302,10 +287,9 @@ def plot_figure(agent: Agent, episode: int):
     plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Life {episode} | Avg Reward {avg_reward:.1f}")
-    plt.plot(1 + np.arange(len(agent.custom_rewards)), agent.custom_rewards, label='Custom Reward')
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
     plt.xlim(left=1, right=len(agent.rewards))
-    plt.ylim(bottom=max(-1000.0, min(min(agent.rewards), min(agent.custom_rewards))))
+    plt.ylim(bottom=max(-1000.0, min(agent.rewards)))
     plt.legend()
 
     arr = np.array(agent.rewards)
@@ -339,7 +323,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
     agent.online.eval()
 
     with torch.no_grad():
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, life_episode=True, level=None)
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, level=None)
         eval_rewards = [0, 0, 0]
         farest_x = 0
         for i in range(3):
@@ -373,32 +357,8 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
 
     agent.online.train()
 
-def learn_human_play(agent: Agent):
-    import pickle
-
-    # ids = [40, 41, 42, 43, 44]
-    ids = [45, 46, 47, 48]
-
-    for id in ids:
-        path = f"./human_play/play_{id}.pkl"
-        with open(path, 'rb') as f:
-            play = pickle.load(f)
-        episode_reward = play['total_reward']
-        trajectory = play['trajectory']
-
-        for state, action, reward, next_state, done in trajectory:
-            agent.buffer.store(state, action, reward, next_state, done)
-
-            if agent.buffer.size < BATCH_SIZE:
-                continue
-
-            dqn_loss = agent.learn()
-            agent.dqn_losses.append(dqn_loss)
-
-        tqdm.write(f"Learn from {path}, total reward: {episode_reward}, frames: {len(trajectory)}")
-
 def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
-    env = make_env(SKIP_FRAMES, STACK_FRAMES, MAX_EPISODE_STEPS, False)
+    env = make_env(SKIP_FRAMES, STACK_FRAMES, False)
     print(f"observation_space.shape: {env.observation_space.shape}")
 
     agent = Agent(env.observation_space.shape, env.action_space.n)
@@ -412,8 +372,6 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         start_episode = len(agent.rewards) + 1
 
     agent.online.train()
-
-    # learn_human_play(agent)
 
     # Warm-up
     state = env.reset()
@@ -429,20 +387,14 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     progress_bar = tqdm(total=MAX_TRAINING_FRAMES, desc="Training")
     progress_bar.update(len(agent.dqn_losses))
 
-    count_truncated = 0
-
-    last_x_pos = 0
-
     for episode in range(start_episode, num_episodes + 1):
 
         state = env.reset()
-        episode_reward        = 0
-        episode_custom_reward = 0
-        steps                 = 0
-        # stuck_steps           = 0
-        # prev_x                = None
-        done                  = False
-        truncated             = False
+        episode_reward  = 0
+        steps           = 0
+        done            = False
+        farest_x        = 0
+        flag            = False
 
         while not done:
             agent.frame_idx += 1
@@ -451,69 +403,25 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             action = agent.act(state, deterministic=(np.random.rand() >= agent.epsilon))
 
             next_state, reward, done, info = env.step(action)
-            truncated = info.get('TimeLimit.truncated', False)
-
+            episode_reward += reward
             if RENDER:
                 env.render()
 
-            if not done:
-                last_x_pos = info['x_pos']
+            farest_x = max(farest_x, info['x_pos'])
+            if info['flag_get']:
+                flag = True
 
-            # Reward Shaping
-            custom_reward = reward
-
-            # if action >= 10:
-            #     custom_reward += UP_DOWN_PENALTY
-            # elif action > 5:
-            #     custom_reward += LEFT_PENALTY
-
-            # if done and not info['flag_get']:
-            #     custom_reward += DEATH_PENALTY
-
-            # x_pos = info['x_pos']
-            # if prev_x is None:
-            #     prev_x = x_pos
-            # dx = x_pos - prev_x
-            # prev_x = x_pos
-
-            # if dx <= 1:
-            #     stuck_steps += 1
-            # else:
-            #     stuck_steps = 0
-
-            # if stuck_steps >= STUCK_PENALTY_STEP:
-            #     custom_reward += STUCK_PENALTY
-            # if stuck_steps >= STUCK_TRUNCATE_STEP:
-            #     truncated = True
-            #     done = True
-
-            # if dx < 0:
-            #     custom_reward += BACKWARD_PENALTY
-            # else:
-            #     custom_reward += VELOCITY_REWARD * dx
-            # v = episode_reward / steps
-            # if v >= 3.0:
-            #     custom_reward += VELOCITY_REWARD * v
-
-            # if truncated:
-            #     custom_reward += TRUNCATE_PENALTY
-
-            agent.buffer.store(state, action, custom_reward, next_state, done or truncated)
+            agent.buffer.store(state, action, reward, next_state, done)
+            state = next_state
 
             dqn_loss = agent.learn()
             agent.dqn_losses.append(dqn_loss)
 
-            state = next_state
-            episode_custom_reward += custom_reward
-            episode_reward += reward
             progress_bar.update(1)
             if agent.frame_idx >= MAX_TRAINING_FRAMES:
                 break
 
         agent.rewards.append(episode_reward)
-        agent.custom_rewards.append(episode_custom_reward)
-        if truncated:
-            count_truncated += 1
 
         # Check parameters
         if CHECK_PARAM_INTERVAL > 0 and episode % CHECK_PARAM_INTERVAL == 0:
@@ -524,24 +432,16 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.check_gradients()
 
         # Logging
-        tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated} | Epsilon {agent.epsilon:.4f} | X {last_x_pos}")
+        tqdm.write(
+            f"Episode {episode}\t| "
+            f"Steps {steps}\t| "
+            f"Reward {episode_reward:.0f}\t| "
+            f"Flag {flag}\t| "
+            f"Epsilon {agent.epsilon:.4f} | "
+            f"Farest X {farest_x}"
+        )
 
         agent.epsilon = max(EPSILON_MIN, agent.epsilon * EPSILON_DECAY)
-
-        # Logging
-        if episode % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(
-                agent.rewards[-PLOT_INTERVAL:]
-                if len(agent.rewards) >= PLOT_INTERVAL
-                else agent.rewards
-            )
-            avg_custom_reward = np.mean(
-                agent.custom_rewards[-PLOT_INTERVAL:]
-                if len(agent.custom_rewards) >= PLOT_INTERVAL
-                else agent.custom_rewards
-            )
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
-            count_truncated = 0
 
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
@@ -553,6 +453,12 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
         # Save model
         if episode % SAVE_INTERVAL == 0:
+            avg_reward = np.mean(
+                agent.rewards[-SAVE_INTERVAL:]
+                if len(agent.rewards) >= SAVE_INTERVAL
+                else agent.rewards
+            )
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | ")
             agent.save_model(checkpoint_path)
             tqdm.write(f"Model saved at episode {episode}")
 
