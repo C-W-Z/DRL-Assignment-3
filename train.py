@@ -23,23 +23,22 @@ STACK_FRAMES            = 4
 # DQN
 TARGET_UPDATE           = 5
 TAU                     = 0.001
-LEARNING_RATE           = 5e-4
+LEARNING_RATE           = 1e-4
 ADAM_EPS                = 0.00015
+WEIGHT_DECAY            = 1e-6
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
 ICM_ETA                 = 1.0
-ICM_EMBED_DIM           = 512
-LAMBDA                  = 0.2
+ICM_EMBED_DIM           = 256
+ICM_LEARNING_RATE       = 5e-4
 
 # Epsilon Boltzmann Exploration
-EPSILON_START           = 1.0
-EPSILON_MIN             = 0.1
-EPSILON_DECAY           = 0.999
+EPSILON                 = 0.1
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
-MEMORY_SIZE             = 100000
+MEMORY_SIZE             = 50000
 BATCH_SIZE              = 64
 GAMMA                   = 0.95
 N_STEP                  = 5
@@ -146,27 +145,51 @@ class D3QN(nn.Module):
 
 # ------- Agent -------
 
+def build_dqn_optimizer(model: nn.Module):
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 排除 bias 與 norm 層參數
+        if name.endswith(".bias") or "norm" in name or "bn" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optimizer = Adam(
+        [
+            {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=LEARNING_RATE,
+        eps=ADAM_EPS
+    )
+    return optimizer
+
 class Agent:
     def __init__(self, obs_shape: Tuple, n_actions: int, device=None):
-        self.device     = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-        self.n_actions  = n_actions
+        self.device         = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.n_actions      = n_actions
 
-        self.online     = D3QN(obs_shape[0], n_actions).to(self.device)
-        self.target     = D3QN(obs_shape[0], n_actions).to(self.device)
+        self.online         = D3QN(obs_shape[0], n_actions).to(self.device)
+        self.target         = D3QN(obs_shape[0], n_actions).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
-        self.icm        = ICM(self.online.feature_dimension, n_actions).to(self.device)
+        self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
 
-        self.optimizer  = Adam(list(self.online.parameters()) + list(self.icm.parameters()), lr=LEARNING_RATE, eps=ADAM_EPS)
+        # self.optimizer      = Adam(self.online.parameters(), lr=LEARNING_RATE, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY)
+        self.optimizer      = build_dqn_optimizer(self.online)
+        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-        self.buffer     = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
+        self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
         self.dqn_criterion      = nn.MSELoss(reduction='none')
         self.forward_criterion  = nn.MSELoss()
         self.inverse_criterion  = nn.CrossEntropyLoss()
 
-        self.epsilon           = EPSILON_START
         self.frame_idx         = 0
         self.rewards           = []
         self.dqn_losses        = []
@@ -283,12 +306,17 @@ class Agent:
 
         # ----- Update -----
         self.optimizer.zero_grad()
-        (LAMBDA * dqn_loss + icm_loss).backward()
+        dqn_loss.backward()
         U.clip_grad_norm_(self.online.parameters(), 5.0)
-        U.clip_grad_norm_(self.icm.parameters(), 5.0)
         # U.clip_grad_value_(self.online.parameters(), 1.0)
-        # U.clip_grad_value_(self.icm.parameters(), 1.0)
+
         self.optimizer.step()
+
+        self.icm_optimizer.zero_grad()
+        icm_loss.backward()
+        U.clip_grad_norm_(self.icm.parameters(), 5.0)
+        # U.clip_grad_value_(self.icm.parameters(), 1.0)
+        self.icm_optimizer.step()
 
         self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
@@ -303,45 +331,54 @@ class Agent:
 
         return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 
-    def save_model(self, path):
-        # torch.save({
-        #     'online'           : self.online.state_dict(),
-        #     'target'           : self.target.state_dict(),
-        #     'icm'              : self.icm.state_dict(),
-        #     'optimizer'        : self.optimizer.state_dict(),
-        #     'epsilon'          : self.epsilon,
-        #     'frame_idx'        : self.frame_idx,
-        #     'rewards'          : self.rewards,
-        #     'dqn_losses'       : self.dqn_losses,
-        #     'forward_losses'   : self.forward_losses,
-        #     'inverse_losses'   : self.inverse_losses,
-        #     'intrinsic_rewards': self.intrinsic_rewards,
-        #     'eval_rewards'     : self.eval_rewards,
-        #     'best_eval_reward' : self.best_eval_reward,
-        #     'buffer_state'     : self.buffer.get_state(),
-        # }, path, pickle_protocol=4)
+    def save_model(self, path: str, dqn_only=False):
+        # 儲存主 DQN 模型
         torch.save(self.online.state_dict(), path, pickle_protocol=4)
+        if dqn_only:
+            return
+        assert path.endswith('.pth')
+        # 儲存其他 metadata
+        meta_path = path.replace('.pth', '.meta.pth')
+        torch.save({
+            'target'           : self.target.state_dict(),
+            'icm'              : self.icm.state_dict(),
+            'optimizer'        : self.optimizer.state_dict(),
+            'icm_optimizer'    : self.icm_optimizer.state_dict(),
+            'frame_idx'        : self.frame_idx,
+            'rewards'          : self.rewards,
+            'dqn_losses'       : self.dqn_losses,
+            'forward_losses'   : self.forward_losses,
+            'inverse_losses'   : self.inverse_losses,
+            'intrinsic_rewards': self.intrinsic_rewards,
+            'eval_rewards'     : self.eval_rewards,
+            'best_eval_reward' : self.best_eval_reward,
+            'buffer_state'     : self.buffer.get_state(),
+        }, meta_path, pickle_protocol=4)
 
     def load_model(self, path, eval_mode=False):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        # self.online.load_state_dict(checkpoint['online'])
-        # if eval_mode:
-        #     self.online.eval()
-        #     return
-        # self.target.load_state_dict(checkpoint['target'])
-        # self.icm.load_state_dict(checkpoint['icm'])
-        # self.optimizer.load_state_dict(checkpoint['optimizer'])
-        # self.epsilon           = checkpoint.get('epsilon', EPSILON_START)
-        # self.frame_idx         = checkpoint.get('frame_idx', 0)
-        # self.rewards           = checkpoint.get('rewards', [])
-        # self.dqn_losses        = checkpoint.get('dqn_losses', [])
-        # self.forward_losses    = checkpoint.get('forward_losses', [])
-        # self.inverse_losses    = checkpoint.get('inverse_losses', [])
-        # self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
-        # self.eval_rewards      = checkpoint.get('eval_rewards', [])
-        # self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
-        # self.buffer.set_state(checkpoint['buffer_state'])
-        self.online.load_state_dict(checkpoint)
+        # 先載入 DQN 模型
+        self.online.load_state_dict(torch.load(path, map_location=self.device), weights_only=True)
+        if eval_mode:
+            self.online.eval()
+            return
+        assert path.endswith('.pth')
+        # 載入 metadata
+        meta_path = path.replace('.pth', '.meta.pth')
+        checkpoint = torch.load(meta_path, map_location=self.device, weights_only=False)
+        self.target.load_state_dict(checkpoint['target'])
+        self.icm.load_state_dict(checkpoint['icm'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
+        self.frame_idx         = checkpoint.get('frame_idx', 0)
+        self.rewards           = checkpoint.get('rewards', [])
+        self.dqn_losses        = checkpoint.get('dqn_losses', [])
+        self.forward_losses    = checkpoint.get('forward_losses', [])
+        self.inverse_losses    = checkpoint.get('inverse_losses', [])
+        self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
+        self.eval_rewards      = checkpoint.get('eval_rewards', [])
+        self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
+        self.buffer.set_state(checkpoint['buffer_state'])
+
 
 # ------- Training Functions -------
 
@@ -425,44 +462,33 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
         )
 
         if total_eval_reward >= 3000 and total_eval_reward == agent.best_eval_reward:
-            agent.save_model(best_checkpoint_path)
+            agent.save_model(best_checkpoint_path, dqn_only=True)
             print(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
 
     agent.online.train()
 
 def train(
+    agent: Agent,
     max_episodes: int,
     level: str=None,
     checkpoint_path='models/d3qn_icm_epsilonboltz.pth',
     best_checkpoint_path='models/d3qn_icm_epsilonboltz_best.pth',
-    reset_epsilon=False
 ):
-
     env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False, level=level)
-
-    agent = Agent(env.observation_space.shape, env.action_space.n)
-    if reset_epsilon:
-        agent.epsilon = EPSILON_START
-
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-    os.makedirs(PLOT_DIR, exist_ok=True)
-
-    start_episode = 1
-    if os.path.isfile(checkpoint_path):
-        agent.load_model(checkpoint_path)
-        start_episode = len(agent.rewards) + 1
 
     agent.online.train()
 
     # Warm-up
     state = env.reset()
     while agent.buffer.size < BATCH_SIZE:
-        action = np.random.randint(env.action_space.n)
+        action = agent.act(state, deterministic=False)
         next_state, reward, done, _ = env.step(action)
         agent.buffer.store(state, action, reward, next_state, done)
         state = next_state
         if done:
             state = env.reset()
+
+    start_episode = len(agent.rewards) + 1
 
     for episode in range(start_episode, max_episodes + 1):
 
@@ -477,7 +503,7 @@ def train(
             agent.frame_idx += 1
             steps += 1
 
-            action = agent.act(state, deterministic=(np.random.rand() >= agent.epsilon))
+            action = agent.act(state, deterministic=(np.random.rand() >= EPSILON))
 
             next_state, reward, done, info = env.step(action)
             episode_reward += reward
@@ -513,11 +539,8 @@ def train(
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
             f"Flag {flag}\t| "
-            f"Epsilon {agent.epsilon:.4f} | "
             f"Farest X {farest_x}"
         )
-
-        agent.epsilon = max(EPSILON_MIN, agent.epsilon * EPSILON_DECAY)
 
         # Evaluation
         if episode % EVAL_INTERVAL == 0:
@@ -541,6 +564,21 @@ def train(
     env.close()
 
 if __name__ == '__main__':
+    checkpoint_path='models/d3qn_icm_lv1.pth'
+
+    agent = Agent((4, 84, 84), 12)
+
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    if os.path.isfile(checkpoint_path):
+        agent.load_model(checkpoint_path)
+
     # train each level 3000 episodes
-    train(max_episodes=3000, level='1-1')
-    train(max_episodes=6000, level='1-2', reset_epsilon=True)
+    train(agent, max_episodes=3000, level='1-1', checkpoint_path='models/d3qn_icm_lv1.pth')
+    # train(agent, max_episodes=6000, level='1-2')
+    # ep = 6000
+    # for _ in range(10):
+    #     ep += 300
+    #     train(agent, max_episodes=ep, level='1-1')
+    #     ep += 300
+    #     train(agent, max_episodes=ep, level='1-2')
