@@ -3,11 +3,9 @@ from tensordict import TensorDict
 import torch
 
 class ReplayBuffer:
-    def __init__(self, obs_shape, size, batch_size, n_step, gamma, device=None):
+    def __init__(self, obs_shape, size, batch_size, device=None):
         self.obs_shape = obs_shape
         self.batch_size = batch_size
-        self.n_step = n_step
-        self.gamma = gamma
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.buffer = TensorDictReplayBuffer(

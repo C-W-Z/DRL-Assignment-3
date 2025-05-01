@@ -8,8 +8,11 @@ import torch.nn.functional as F
 import torch.nn.utils as U
 from torch.optim import Adam
 from numba import njit
+from collections import deque
+from torchrl.data import TensorDictReplayBuffer, LazyTensorStorage
+from tensordict import TensorDict
+
 from env_wrapper import make_env
-from per import PrioritizedReplayBuffer
 
 # -----------------------------
 # Hyperparameters
@@ -57,11 +60,85 @@ CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
-# ------- Prioritized Replay Buffer -------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-@njit
-def _get_beta_by_frame(frame_idx: int):
-    return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
+# ------- N-Step Replay Buffer -------
+
+class NStepReplayBuffer:
+    def __init__(self):
+        self.n_step_queue = deque()
+
+        self.buffer = TensorDictReplayBuffer(
+            storage=LazyTensorStorage(max_size=MEMORY_SIZE, device=DEVICE),
+            batch_size=BATCH_SIZE
+        )
+
+    @property
+    def size(self):
+        return len(self.buffer)
+
+    def store(self, obs, action, reward, next_obs, done):
+        self.n_step_queue.append((obs, action, reward, next_obs, done))
+
+        if len(self.n_step_queue) < N_STEP:
+            return
+
+        if len(self.n_step_queue) < N_STEP:
+            return
+
+        # 建立 n-step transition
+        R, s0, a0 = 0, *self.n_step_queue[0][:2]
+
+        g = GAMMA
+        for _, _, r, _, d in self.n_step_queue:
+            R += g * r
+            g *= GAMMA
+            if d:
+                break
+
+        # 下一狀態為最後一筆的 next_state
+        _, _, _, s_n, done_n = self.n_step_queue[-1]
+
+        data = TensorDict({
+            'obs':       torch.tensor(s0, dtype=torch.float32),
+            'acts':      torch.tensor([a0], dtype=torch.int64),
+            'rews':      torch.tensor([R], dtype=torch.float32),
+            'next_obs':  torch.tensor(s_n, dtype=torch.float32),
+            'done':      torch.tensor([done_n], dtype=torch.bool),
+        }, batch_size=[]).to(DEVICE)
+
+        self.buffer.add(data)
+
+        # 移除最前面一筆，讓 buffer 滾動
+        self.n_step_queue.popleft()
+
+        if done:
+            # 清空整個 queue
+            self.finish_episode()
+
+    def finish_episode(self):
+        # 用來在 episode 結束後強制 flush 剩下步數
+        while self.n_step_queue:
+            self.store(*self.n_step_queue.popleft())
+
+    def sample_batch(self):
+        batch = self.buffer.sample(batch_size=BATCH_SIZE)
+
+        return {
+            'obs':       batch['obs'],
+            'acts':      batch['acts'].squeeze(1),
+            'rews':      batch['rews'].squeeze(1),
+            'next_obs':  batch['next_obs'],
+            'done':      batch['done'].float().squeeze(1),
+        }
+
+    def get_state(self):
+        return {
+            'storage': self.buffer._storage._storage,
+        }
+
+    def set_state(self, state):
+        self.buffer._storage._storage = state['storage']
 
 # ------- Intrinsic Curiosity Module -------
 
@@ -169,24 +246,24 @@ def build_dqn_optimizer(model: nn.Module):
     return optimizer
 
 class Agent:
-    def __init__(self, obs_shape: Tuple, n_actions: int, device=None):
-        self.device         = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    def __init__(self, obs_shape: Tuple, n_actions: int):
         self.n_actions      = n_actions
 
-        self.online         = D3QN(obs_shape[0], n_actions).to(self.device)
-        self.target         = D3QN(obs_shape[0], n_actions).to(self.device)
+        self.online         = D3QN(obs_shape[0], n_actions).to(DEVICE)
+        self.target         = D3QN(obs_shape[0], n_actions).to(DEVICE)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
-        self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
+        self.icm            = ICM(self.online.feature_dimension, n_actions).to(DEVICE)
 
         # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
         self.optimizer      = build_dqn_optimizer(self.online)
         self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE, weight_decay=DQN_WEIGHT_DECAY)
 
-        self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
+        # self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
+        self.buffer         = NStepReplayBuffer()
 
-        self.dqn_criterion      = nn.MSELoss(reduction='none')
+        self.dqn_criterion      = nn.MSELoss()
         self.forward_criterion  = nn.MSELoss()
         self.inverse_criterion  = nn.CrossEntropyLoss()
 
@@ -200,7 +277,7 @@ class Agent:
         self.best_eval_reward  = -np.inf
 
     def act(self, state, deterministic=False, tau=EXPLORE_TAU):
-        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             q_values = self.online(state_tensor)  # Shape: (1, n_actions)
             if not self.online.training or deterministic:
@@ -276,14 +353,12 @@ class Agent:
                 print(stat)
 
     def learn(self):
-        batch       = self.buffer.sample_batch(_get_beta_by_frame(self.frame_idx))
-        states      = torch.tensor(batch['obs'], dtype=torch.float32, device=self.device)
-        actions     = torch.tensor(batch['acts'], dtype=torch.int64, device=self.device)
-        rewards     = torch.tensor(batch['rews'], dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(batch['next_obs'], dtype=torch.float32, device=self.device)
-        dones       = torch.tensor(batch['done'], dtype=torch.float32, device=self.device)
-        weights     = torch.tensor(batch['weights'], dtype=torch.float32, device=self.device)
-        indices     = batch['indices']
+        batch = self.buffer.sample_batch()
+        states      = batch['obs'].to(DEVICE)
+        next_states = batch['next_obs'].to(DEVICE)
+        actions     = batch['acts'].to(DEVICE)
+        rewards     = batch['rews'].to(DEVICE)
+        dones       = batch['done'].to(DEVICE)
 
         # ----- ICM -----
         features        = self.online.feature_layer(states).detach()
@@ -301,8 +376,8 @@ class Agent:
             q_next       = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             q_target     = rewards + intrinsic_reward + GAMMA_POW_N_STEP * q_next * (1 - dones)
         q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-        td_value    = q_predicted - q_target.detach()
-        dqn_loss    = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
+        # td_value    = q_predicted - q_target.detach()
+        dqn_loss    = self.dqn_criterion(q_predicted, q_target.detach())
 
         # ----- Update -----
         self.optimizer.zero_grad()
@@ -317,8 +392,6 @@ class Agent:
         U.clip_grad_norm_(self.icm.parameters(), 5.0)
         # U.clip_grad_value_(self.icm.parameters(), 1.0)
         self.icm_optimizer.step()
-
-        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
         if self.frame_idx % TARGET_UPDATE_FRAMES == 0:
             if TARGET_UPDATE_TAU == 1.0:
@@ -357,14 +430,14 @@ class Agent:
 
     def load_model(self, path, eval_mode=False):
         # 先載入 DQN 模型
-        self.online.load_state_dict(torch.load(path, map_location=self.device), weights_only=True)
+        self.online.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=False))
         if eval_mode:
             self.online.eval()
             return
         assert path.endswith('.pth')
         # 載入 metadata
         meta_path = path.replace('.pth', '.meta.pth')
-        checkpoint = torch.load(meta_path, map_location=self.device, weights_only=False)
+        checkpoint = torch.load(meta_path, map_location=DEVICE, weights_only=False)
         self.target.load_state_dict(checkpoint['target'])
         self.icm.load_state_dict(checkpoint['icm'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
