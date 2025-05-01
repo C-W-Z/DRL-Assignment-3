@@ -18,7 +18,7 @@ from per import PrioritizedReplayBuffer
 # -----------------------------
 # Hyperparameters
 # -----------------------------
-RENDER                  = False
+RENDER                  = True
 
 # Env Wrappers
 SKIP_FRAMES             = 4
@@ -28,11 +28,11 @@ MAX_EPISODE_STEPS       = None
 # Agent
 TARGET_UPDATE           = 1000
 TAU                     = 0.25
-LEARNING_RATE           = 0.0002 # 0 lives: 2.5e-4, 1260 lives: 2e-4
+LEARNING_RATE           = 0.0005 # 0 lives: 2.5e-4, 1260 lives: 2e-4, 9540: 5e-4
 ADAM_EPS                = 0.00015
 # Boltzmann Exploration
 EXPLORE_TAU             = 2.0
-DETERMINISTIC_X         = 0
+DETERMINISTIC_X         = 0 # 開始0, 9270 lives以後800, 9360以後1200
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30000
@@ -179,9 +179,9 @@ class Agent:
             if not self.online.training or deterministic:
                 # Greedy selection (evaluation mode)
                 # Mask Q-values for invalid actions
-                # masked_q_values = q_values + (action_mask - 1) * 1e9  # Large negative for masked actions
-                # action = masked_q_values.argmax(dim=1).item()
-                return int(q_values.argmax(dim=1).item())
+                masked_q_values = q_values + (action_mask - 1) * 1e9  # Large negative for masked actions
+                action = masked_q_values.argmax(dim=1).item()
+                return int(masked_q_values.argmax(dim=1).item())
             else:
                 # Boltzmann exploration (training mode)
                 # Apply mask to Q-values before softmax
@@ -385,13 +385,13 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
             state = eval_env.reset()
             eval_reward = 0
             done = False
-            steps = 0
+            # prev_x = 0
             while not done:
                 e_action = agent.act(state, deterministic=True)
-                if steps == 0:
-                    e_action = 3
-                    steps += 1
-                state, reward, done, _ = eval_env.step(e_action)
+                # if prev_x < 250:
+                #     e_action = 3
+                state, reward, done, info = eval_env.step(e_action)
+                # prev_x = info['x_pos']
                 if RENDER:
                     eval_env.render()
                 eval_reward += reward
@@ -467,36 +467,6 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     last_x_pos = 0
     # stage = 0
 
-    def process(episode, count_truncated = 0):
-        # Logging
-        if episode % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(
-                agent.rewards[-PLOT_INTERVAL:]
-                if len(agent.rewards) >= PLOT_INTERVAL
-                else agent.rewards
-            )
-            avg_custom_reward = np.mean(
-                agent.custom_rewards[-PLOT_INTERVAL:]
-                if len(agent.custom_rewards) >= PLOT_INTERVAL
-                else agent.custom_rewards
-            )
-            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
-            count_truncated = 0
-
-        # Evaluation
-        if episode % EVAL_INTERVAL == 0:
-            evaluation(agent, episode, best_checkpoint_path)
-            agent.online.train()
-
-        # Plot
-        if episode % PLOT_INTERVAL == 0:
-            plot_figure(agent, episode)
-
-        # Save model
-        if episode % SAVE_INTERVAL == 0:
-            agent.save_model(checkpoint_path)
-            tqdm.write(f"Model saved at episode {episode}")
-
     trajectory = []
 
     for episode in range(start_episode, num_episodes + 1):
@@ -519,28 +489,34 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             # loss有明顯收斂再慢慢降低前面的tau值
             tau = EXPLORE_TAU # 2.0
             if prev_x and prev_x < 320:
-                tau = 0.7 # 初始2.0, 450 lives以後0.9, 900 lives以後0.8, 1110 lives以後0.7
+                tau = 2.0 # 初始2.0, 450 lives以後0.9, 900 lives以後0.8, 1110 lives以後0.7, 9090以後0.5
             elif prev_x and prev_x < 800: # 1110 lives以後加上這行
-                tau = 0.8 # 開始1.0, 1260 lives開始 0.9, 1800 lives以後0.8
+                tau = 0.7 # 開始1.0, 1260 lives開始 0.9, 1800 lives以後0.8, 9090以後0.7
             elif prev_x and prev_x < 1100: # 1110 lives以後加上這行
-                tau = 1.2 # 開始1.5, 1440 lives以後1.4, 1800 lives以後1.2
+                tau = 0.9 # 開始1.5, 1440 lives以後1.4, 1800 lives以後1.2, 9090以後1.0, 10170以後0.9
             elif prev_x and prev_x < 1500: # 1440 lives以後加上這行
-                tau = 1.2 # 開始1.7, 1800 lives以後1.5, 1890 lives以後1.2
+                tau = 1.0 # 開始1.7, 1800 lives以後1.5, 1890 lives以後1.2, 9360以後1.0
+            elif prev_x and prev_x < 2400: # 9270以後加上這行
+                tau = 1.5
 
-            constraint_step = 2
-            if prev_x and 800 <= prev_x <= 1000:
-                constraint_step = 5
-            elif prev_x and 400 <= prev_x <= 1000:
-                constraint_step = 3
+            constraint_step = 0
+            if prev_x:
+                if  2300 <= prev_x <= 2500:
+                    constraint_step = 5
+                elif 1050 <= prev_x <= 1450:
+                    constraint_step = 8
+                elif 850 <= prev_x <= 1000:
+                    constraint_step = 10
+                elif 700 <= prev_x <= 730:
+                    constraint_step = 8
+                elif 400 <= prev_x <= 700:
+                    constraint_step = 5
 
-            if steps == 1:
-                action = 3
-            else:
-                action = agent.act(state,
-                               tau=tau,
-                               deterministic=last_x_pos <= DETERMINISTIC_X or episode % EVAL_INTERVAL == 0,
-                               constraint_steps=constraint_step
-                               )
+            action = agent.act(state,
+                            tau=tau,
+                            deterministic=last_x_pos <= DETERMINISTIC_X or episode % EVAL_INTERVAL == 0,
+                            constraint_steps=constraint_step
+                            )
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
@@ -554,6 +530,10 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
             # Reward Shaping
             custom_reward = reward
+
+            if prev_x and prev_x < 250 and action not in {1, 3}:
+                truncated = True
+                done = True
 
             if action >= 10:
                 custom_reward += UP_DOWN_PENALTY
@@ -627,7 +607,35 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
         # Logging
         tqdm.write(f"Episode {episode}\t| Steps {steps}\t| Reward {episode_reward:.0f}\t| Custom Reward {episode_custom_reward:.1f}\t| Stage {env.unwrapped._stage} | Truncated {truncated} | X {last_x_pos}")
 
-        process(episode, count_truncated)
+                # Logging
+        if episode % PLOT_INTERVAL == 0:
+            avg_reward = np.mean(
+                agent.rewards[-PLOT_INTERVAL:]
+                if len(agent.rewards) >= PLOT_INTERVAL
+                else agent.rewards
+            )
+            avg_custom_reward = np.mean(
+                agent.custom_rewards[-PLOT_INTERVAL:]
+                if len(agent.custom_rewards) >= PLOT_INTERVAL
+                else agent.custom_rewards
+            )
+            tqdm.write(f"Avg Reward {avg_reward:.1f} | Avg Custom Reward {avg_custom_reward:.1f} | Truncated {count_truncated}")
+            count_truncated = 0
+
+        # Evaluation
+        if episode % EVAL_INTERVAL == 0:
+            evaluation(agent, episode, best_checkpoint_path)
+            agent.online.train()
+
+        # Plot
+        if episode % PLOT_INTERVAL == 0:
+            plot_figure(agent, episode)
+
+        # Save model
+        if episode % SAVE_INTERVAL == 0:
+            agent.save_model(checkpoint_path)
+            tqdm.write(f"Model saved at episode {episode}")
+
 
         if agent.frame_idx >= MAX_FRAMES:
             break
@@ -636,4 +644,4 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     env.close()
 
 if __name__ == '__main__':
-    train(num_episodes=10000)
+    train(num_episodes=20000)
