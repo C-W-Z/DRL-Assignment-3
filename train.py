@@ -51,11 +51,11 @@ VELOCITY_REWARD         = 0
 BACKWARD_PENALTY        = 0
 TRUNCATE_PENALTY        = -100
 STUCK_PENALTY           = -0.1
-STUCK_PENALTY_STEP      = 50
+STUCK_PENALTY_STEP      = 100
 STUCK_TRUNCATE_STEP     = 300
-DEATH_PENALTY           = -35
+DEATH_PENALTY           = -100
 UP_DOWN_PENALTY         = -10
-LEFT_PENALTY            = -1
+LEFT_PENALTY            = -5
 
 # Output
 EVAL_INTERVAL           = 30
@@ -467,9 +467,8 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
     last_x_pos = 0
     # stage = 0
 
-    trajectory = []
-
     for episode in range(start_episode, num_episodes + 1):
+        # trajectory = []
 
         agent.reset_action_constraint()
 
@@ -486,37 +485,7 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
             agent.frame_idx += 1
             steps += 1
 
-            # loss有明顯收斂再慢慢降低前面的tau值
-            tau = EXPLORE_TAU # 2.0
-            if prev_x and prev_x < 320:
-                tau = 2.0 # 初始2.0, 450 lives以後0.9, 900 lives以後0.8, 1110 lives以後0.7, 9090以後0.5
-            elif prev_x and prev_x < 800: # 1110 lives以後加上這行
-                tau = 0.7 # 開始1.0, 1260 lives開始 0.9, 1800 lives以後0.8, 9090以後0.7
-            elif prev_x and prev_x < 1100: # 1110 lives以後加上這行
-                tau = 0.9 # 開始1.5, 1440 lives以後1.4, 1800 lives以後1.2, 9090以後1.0, 10170以後0.9
-            elif prev_x and prev_x < 1500: # 1440 lives以後加上這行
-                tau = 1.0 # 開始1.7, 1800 lives以後1.5, 1890 lives以後1.2, 9360以後1.0
-            elif prev_x and prev_x < 2400: # 9270以後加上這行
-                tau = 1.5
-
-            constraint_step = 0
-            if prev_x:
-                if  2300 <= prev_x <= 2500:
-                    constraint_step = 5
-                elif 1050 <= prev_x <= 1450:
-                    constraint_step = 8
-                elif 850 <= prev_x <= 1000:
-                    constraint_step = 10
-                elif 700 <= prev_x <= 730:
-                    constraint_step = 8
-                elif 400 <= prev_x <= 700:
-                    constraint_step = 5
-
-            action = agent.act(state,
-                            tau=tau,
-                            deterministic=last_x_pos <= DETERMINISTIC_X or episode % EVAL_INTERVAL == 0,
-                            constraint_steps=constraint_step
-                            )
+            action = agent.act(state, deterministic=last_x_pos <= DETERMINISTIC_X or episode % EVAL_INTERVAL == 0)
 
             next_state, reward, done, info = env.step(action)
             truncated = info.get('TimeLimit.truncated', False)
@@ -526,14 +495,10 @@ def train(num_episodes: int, checkpoint_path='models/d3qn_per_bolzman.pth', best
 
             if not done:
                 last_x_pos = info['x_pos']
-            stage = info['stage']
+            # stage = info['stage']
 
             # Reward Shaping
             custom_reward = reward
-
-            if prev_x and prev_x < 250 and action not in {1, 3}:
-                truncated = True
-                done = True
 
             if action >= 10:
                 custom_reward += UP_DOWN_PENALTY
