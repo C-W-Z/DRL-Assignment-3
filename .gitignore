@@ -4,7 +4,7 @@
 drl-hw3
 
 ll
-models
+/models/*
 plots
 human_play
 icm_ckpt
@@ -17,3 +17,5 @@ trajectory2play.py
 clean_trajectory.py
 train2.py
 duelicm.py
+
+!/models/d3qn_icm_best_7320score.pth

@@ -205,7 +205,7 @@ class Agent:
         state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
             q_values = self.online(state_tensor)  # Shape: (1, n_actions)
-            if not self.online.training or deterministic:
+            if deterministic:
                 # Greedy selection
                 return int(q_values.argmax(dim=1).item())
             else:
