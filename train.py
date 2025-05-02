@@ -34,7 +34,7 @@ ICM_EMBED_DIM           = 256
 ICM_LEARNING_RATE       = 5e-4
 
 # Epsilon Boltzmann Exploration
-EPSILON                 = 0.1
+EPSILON                 = 0.05 # 0.1 before 300 lives, 0.05 after
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer

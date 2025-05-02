@@ -120,28 +120,6 @@ class FrameProcessing(gym.ObservationWrapper):
         return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
         # assert frame.shape == (1, 84, 84)
 
-# class FrameStack(gym.Wrapper):
-#     def __init__(self, env, n_steps=4):
-#         super().__init__(env)
-#         self.n_steps = n_steps
-#         shp = env.observation_space.shape
-#         self.observation_space = gym.spaces.Box(0, 1, shape=(n_steps * shp[0], shp[1], shp[2]), dtype=np.float32)
-#         self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
-
-#     def reset(self):
-#         obs = self.env.reset()
-#         obs = np.asarray(obs)
-#         for i in range(self.n_steps):
-#             self.frames[i] = obs
-#         return self.frames
-
-#     def step(self, action):
-#         obs, reward, done, info = self.env.step(action)
-#         obs = np.asarray(obs)
-#         self.frames[:-1] = self.frames[1:]
-#         self.frames[-1] = obs
-#         return self.frames, reward, done, info
-
 class FrameStack(gym.Wrapper):
     """Stacks the last k observations along the channel dimension."""
     def __init__(self, env: gym.Env, k: int):
@@ -164,15 +142,15 @@ class FrameStack(gym.Wrapper):
         self.frames.append(obs)
         return np.concatenate(self.frames, axis=0), reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=False, level: str=None):
+def make_env(skip_frames=4, stack_frames=4, life_episode=False, random_start=False, level: str=None):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     # env = NoopResetEnv(env)
-    # if random_start:
-    #     env = RandomStartEnv(env, random_steps=4)
+    if random_start:
+        env = RandomStartEnv(env, random_steps=4)
     env = SkipAndMax(env, skip=skip_frames)
-    # if life_episode:
-    #     env = LifeEpisode(env)
+    if life_episode:
+        env = LifeEpisode(env)
     env = FrameProcessing(env) # (1, 84, 84) [0.0, 1.0]
     env = FrameStack(env, k=stack_frames) # (4, 84, 84)
     # env = TimeLimit(env, 3000)

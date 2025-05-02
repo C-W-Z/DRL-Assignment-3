@@ -5,10 +5,9 @@ from train import Agent as DQNAgent, SKIP_FRAMES, STACK_FRAMES
 from env_wrapper import FrameProcessing
 
 class Agent(object):
-    """Agent that uses a pre-trained Rainbow DQN model with skipframe and resize."""
     def __init__(self):
         self.agent = DQNAgent((4, 84, 84), 12)
-        self.agent.load_model("./models/d3qn_icm_300.pth", eval_mode=True)
+        self.agent.load_model("./models/d3qn_icm_best.pth", eval_mode=True)
         self.agent.online = torch.jit.script(self.agent.online) # 加速推理
 
         # Skipframe 參數
@@ -22,15 +21,15 @@ class Agent(object):
         self.frames = deque(maxlen=STACK_FRAMES)
 
     def act(self, observation):
-        """根據觀測值選擇動作"""
-
-        if self.skip_counter > 0:
-            self.skip_counter -= 1
-            return self.last_action
+        observation = np.asarray(observation)
 
         self.obs_buffer.append(observation)
         while len(self.obs_buffer) < 2:
             self.obs_buffer.append(observation)
+
+        if self.skip_counter > 0:
+            self.skip_counter -= 1
+            return self.last_action
 
         max_frame = np.max(np.stack(self.obs_buffer), axis=0)   # (240, 256, 3) [0, 255]
         processed_obs = FrameProcessing.process(max_frame)      # (1, 84, 84), [0.0, 1.0]
