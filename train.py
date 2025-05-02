@@ -50,7 +50,7 @@ GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
 EVAL_INTERVAL           = 30
-SAVE_INTERVAL           = 300
+SAVE_INTERVAL           = 150
 PLOT_INTERVAL           = 30
 CHECK_PARAM_INTERVAL    = 150
 CHECK_GRAD_INTERVAL     = 150
@@ -354,7 +354,7 @@ class Agent:
 
     def load_model(self, path, eval_mode=False):
         # 先載入 DQN 模型
-        self.online.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+        self.online.load_state_dict(torch.load(path, map_location=self.device, weights_only=False))
         if eval_mode:
             self.online.eval()
             return

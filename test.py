@@ -5,7 +5,7 @@ env = make_env(life_episode=False, level='')
 
 agent = Agent(env.observation_space.shape, env.action_space.n)
 # agent.load_model("./models/d3qn_per_bolzman.pth", eval_mode=True)
-agent.load_model("./icm_ckpt/ckpt-100.pth", eval_mode=True)
+agent.load_model("./models/d3qn_icm_300.pth", eval_mode=True)
 
 while True:
     state = env.reset()

@@ -168,11 +168,11 @@ def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=Fals
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     # env = NoopResetEnv(env)
-    if random_start:
-        env = RandomStartEnv(env, random_steps=4)
+    # if random_start:
+    #     env = RandomStartEnv(env, random_steps=4)
     env = SkipAndMax(env, skip=skip_frames)
-    if life_episode:
-        env = LifeEpisode(env)
+    # if life_episode:
+    #     env = LifeEpisode(env)
     env = FrameProcessing(env) # (1, 84, 84) [0.0, 1.0]
     env = FrameStack(env, k=stack_frames) # (4, 84, 84)
     # env = TimeLimit(env, 3000)
