@@ -97,22 +97,6 @@ class LifeEpisode(gym.Wrapper):
         self.lives = getattr(self.env.unwrapped, '_life', 2)
         return obs
 
-class GrayScaleResize(gym.ObservationWrapper):
-    """Converts observations to grayscale and resizes them."""
-    def __init__(self, env: gym.Env):
-        super().__init__(env)
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Grayscale(),
-            T.Resize((84, 84)),
-            T.ToTensor()
-        ])
-        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 84), dtype=np.float32)
-
-    def observation(self, obs: np.ndarray):
-        """Applies the grayscale and resize transformations to the observation."""
-        return self.transform(obs)
-
 class FrameProcessing(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -180,17 +164,16 @@ class FrameStack(gym.Wrapper):
         self.frames.append(obs)
         return np.concatenate(self.frames, axis=0), reward, done, info
 
-def make_env(skip_frames=4, stack_frames=4, life_episode=True, level: str=None):
+def make_env(skip_frames=4, stack_frames=4, life_episode=True, random_start=False, level: str=None):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
     # env = NoopResetEnv(env)
-    # if random_start:
-    #     env = RandomStartEnv(env, random_steps=4)
+    if random_start:
+        env = RandomStartEnv(env, random_steps=4)
     env = SkipAndMax(env, skip=skip_frames)
     if life_episode:
         env = LifeEpisode(env)
     env = FrameProcessing(env) # (1, 84, 84) [0.0, 1.0]
-    # env = GrayScaleResize(env)
     env = FrameStack(env, k=stack_frames) # (4, 84, 84)
     # env = TimeLimit(env, 3000)
     return env

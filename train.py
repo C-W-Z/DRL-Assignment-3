@@ -48,11 +48,11 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
-EVAL_INTERVAL           = 10
-SAVE_INTERVAL           = 100
-PLOT_INTERVAL           = 10
-CHECK_PARAM_INTERVAL    = 50
-CHECK_GRAD_INTERVAL     = 50
+EVAL_INTERVAL           = 30
+SAVE_INTERVAL           = 300
+PLOT_INTERVAL           = 30
+CHECK_PARAM_INTERVAL    = 150
+CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
@@ -327,7 +327,7 @@ class Agent:
         meta_path = path.replace('.pth', '.meta.pth')
         torch.save({
             'target'           : self.target.state_dict(),
-            'icm'              : self.icm.state_dict(),
+            # 'icm'              : self.icm.state_dict(),
             'optimizer'        : self.optimizer.state_dict(),
             # 'icm_optimizer'    : self.icm_optimizer.state_dict(),
             'frame_idx'        : self.frame_idx,
@@ -352,7 +352,7 @@ class Agent:
         meta_path = path.replace('.pth', '.meta.pth')
         checkpoint = torch.load(meta_path, map_location=self.device, weights_only=False)
         self.target.load_state_dict(checkpoint['target'])
-        self.icm.load_state_dict(checkpoint['icm'])
+        # self.icm.load_state_dict(checkpoint['icm'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         # self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
         self.frame_idx         = checkpoint.get('frame_idx', 0)
@@ -409,7 +409,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
     agent.online.eval()
 
     with torch.no_grad():
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, level=None)
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, random_start=True, level=None)
         eval_rewards = [0, 0, 0]
         farest_x = 0
         for i in range(3):
@@ -450,7 +450,7 @@ def train(
     checkpoint_path='models/d3qn_icm_epsilonboltz.pth',
     best_checkpoint_path='models/d3qn_icm_epsilonboltz_best.pth',
 ):
-    env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False, level=level)
+    env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False, random_start=True, level=level)
 
     agent.online.train()
 
@@ -474,6 +474,7 @@ def train(
         done            = False
         farest_x        = 0
         flag            = False
+        prev_life       = 2
 
         while not done:
             agent.frame_idx += 1
@@ -489,6 +490,10 @@ def train(
             farest_x = max(farest_x, info['x_pos'])
             if info['flag_get']:
                 flag = True
+            life = info['life']
+            if life < prev_life:
+                done = True
+            prev_life = life
 
             agent.buffer.store(state, action, reward, next_state, done)
             state = next_state
