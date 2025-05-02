@@ -1,602 +1,412 @@
 import os
-import random
-from collections import deque, namedtuple
-from typing import Dict, List, Tuple
-import cv2
-import gym
-import gym_super_mario_bros
-from nes_py.wrappers import JoypadSpace
-from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
-from gym.wrappers import TimeLimit
+from typing import Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-# from torchvision import transforms as T
-from tqdm import tqdm
+import torch.nn.utils as U
+from torch.optim import Adam
 from numba import njit
+from env_wrapper import make_env
+from per import PrioritizedReplayBuffer
+from tqdm import tqdm
 
-from segment_tree import SumSegmentTree, MinSegmentTree
-
-Exp = namedtuple('Exp', ['state', 'action', 'reward', 'next_state', 'done'])
-
+# -----------------------------
 # Hyperparameters
-MEMORY_SIZE             = 50000
+# -----------------------------
+RENDER                  = False
+MAX_FRAMES              = 10_000_000
+
+# Env Wrappers
+SKIP_FRAMES             = 4
+STACK_FRAMES            = 4
+
+# DQN
+TARGET_UPDATE_FRAMES    = 500
+TARGET_UPDATE_TAU       = 0.1
+DQN_LEARNING_RATE       = 2.5e-4
+DQN_ADAM_EPS            = 1.5e-4
+DQN_WEIGHT_DECAY        = 1e-6
+
+# Intrinsic Curiosity Module
+ICM_BETA                = 0.2
+ICM_ETA                 = 1.0
+ICM_EMBED_DIM           = 256
+ICM_LEARNING_RATE       = 2.5e-4
+
+# Epsilon Boltzmann Exploration
+EPSILON                 = 0.1
+EXPLORE_TAU             = 1.0
+
+# Prioritized Replay Buffer
+MEMORY_SIZE             = 30_000
 BATCH_SIZE              = 64
-GAMMA                   = 0.95
-TARGET_UPDATE           = 10000
-NOISY_STD_INIT          = 1.0
-LR                      = 0.000002
-ADAM_EPS                = 0.00015
-V_MIN                   = -1000.0
-V_MAX                   = 10000.0
-ATOM_SIZE               = 51
+GAMMA                   = 0.9
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
-BETA_FRAMES             = 1000000
+BETA_FRAMES             = 2_000_000
 PRIOR_EPS               = 1e-6
-TAU                     = 0.9
-SKIP_FRAMES             = 4
-STACK_FRAMES            = 4
-MAX_EPISODE_STEPS       = 3000
-MAX_FRAMES              = 1000000
-BACKWARD_PENALTY        = 0
-STAY_PENALTY            = 0
-DEATH_PENALTY           = -100
-ICM_BETA                = 0.2
-ICM_ETA_START           = 0.1
-ICM_ETA_MIN             = 0.01
-ICM_ETA_FRAMES          = 1000000
-ICM_LR                  = 1e-4
-ICM_EMBED_DIM           = 256
+GAMMA_POW_N_STEP = GAMMA ** N_STEP
+
+# Output
 EVAL_INTERVAL           = 10
-SAVE_INTERVAL           = 100
+SAVE_INTERVAL           = 50
 PLOT_INTERVAL           = 10
+CHECK_PARAM_INTERVAL    = 50
+CHECK_GRAD_INTERVAL     = 50
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
-GAMMA_POW_N_STEP = GAMMA ** N_STEP
+# ------- Prioritized Replay Buffer -------
 
 @njit
-def get_dynamic_beta(frame_idx):
+def _get_beta_by_frame(frame_idx: int):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
-@njit
-def get_dynamic_eta(frame_idx):
-    return max(ICM_ETA_MIN, ICM_ETA_START + frame_idx * (ICM_ETA_MIN - ICM_ETA_START) / ICM_ETA_FRAMES)
-
-# Environment Wrappers (保持不變)
-class SkipAndMax(gym.Wrapper):
-    def __init__(self, env, skip=4):
-        super().__init__(env)
-        self._skip = skip
-        self._obs_buffer = np.zeros((2,) + env.observation_space.shape, dtype=np.uint8)
-
-    def step(self, action):
-        total_reward = 0
-        done = None
-        for i in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
-            self._obs_buffer[i & 1] = np.asarray(obs)
-            total_reward += reward
-            if done:
-                break
-        max_frame = np.max(self._obs_buffer, axis=0)
-        return max_frame, total_reward, done, info
-
-    def reset(self):
-        obs = self.env.reset()
-        obs = np.asarray(obs)
-        self._obs_buffer[0] = self._obs_buffer[1] = obs
-        return obs
-
-class GrayScaleResizeCrop(gym.ObservationWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(1, 84, 84), dtype=np.float32)
-
-    def observation(self, obs):
-        return GrayScaleResizeCrop.process(obs)
-
-    @staticmethod
-    def process(frame):
-        frame = np.asarray(frame)
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        frame = cv2.resize(frame, (84, 110), interpolation=cv2.INTER_AREA)
-        frame = frame[18:102, :]
-        return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
-
-class FrameStack(gym.Wrapper):
-    def __init__(self, env, n_steps=4):
-        super().__init__(env)
-        self.n_steps = n_steps
-        shp = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(0, 1, shape=(shp[0] * n_steps, shp[1], shp[2]), dtype=np.float32)
-        self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
-
-    def reset(self):
-        obs = self.env.reset()
-        obs = np.asarray(obs)
-        for i in range(self.n_steps):
-            self.frames[i] = obs
-        return self.frames
-
-    def step(self, action):
-        obs, reward, done, info = self.env.step(action)
-        obs = np.asarray(obs)
-        self.frames[:-1] = self.frames[1:]
-        self.frames[-1] = obs
-        return self.frames, reward, done, info
-
-def make_env():
-    env = gym_super_mario_bros.make('SuperMarioBros-v0')
-    env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = SkipAndMax(env, skip=SKIP_FRAMES)
-    env = GrayScaleResizeCrop(env)
-    env = FrameStack(env, n_steps=STACK_FRAMES)
-    env = TimeLimit(env, max_episode_steps=MAX_EPISODE_STEPS)
-    return env
-
-# Noisy Linear Layer (保持不變)
-class NoisyLinear(nn.Module):
-    def __init__(self, in_features, out_features, std_init=NOISY_STD_INIT):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.std_init = std_init
-        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
-        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
-        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
-        self.bias_mu = nn.Parameter(torch.empty(out_features))
-        self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        self.register_buffer("bias_epsilon", torch.empty(out_features))
-        self.reset_parameters()
-        self.reset_noise()
-
-    def reset_parameters(self):
-        mu_range = 1 / np.sqrt(self.in_features)
-        self.weight_mu.data.uniform_(-mu_range, mu_range)
-        self.weight_sigma.data.fill_(self.std_init / np.sqrt(self.in_features))
-        self.bias_mu.data.uniform_(-mu_range, mu_range)
-        self.bias_sigma.data.fill_(self.std_init / np.sqrt(self.out_features))
-
-    def reset_noise(self):
-        epsilon_in = self.scale_noise(self.in_features)
-        epsilon_out = self.scale_noise(self.out_features)
-        self.weight_epsilon.copy_(torch.outer(epsilon_out, epsilon_in))
-        self.bias_epsilon.copy_(epsilon_out)
-
-    def forward(self, x):
-        if self.training:
-            weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
-            bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
-        else:
-            weight = self.weight_mu
-            bias = self.bias_mu
-        return F.linear(x, weight, bias)
-
-    @staticmethod
-    def scale_noise(size):
-        x = torch.randn(size)
-        return x.sign().mul(x.abs().sqrt())
-
-# Intrinsic Curiosity Module (ICM) - 改進版
-def _compute_intrinsic_reward(pred_phi_next: torch.Tensor, phi_next: torch.Tensor, eta=0.1):
-    # Compute intrinsic reward based on forward prediction error
-    intrinsic_reward = eta * 0.5 * (pred_phi_next - phi_next).pow(2).sum(dim=1)
-    return intrinsic_reward
+# ------- Intrinsic Curiosity Module -------
 
 class ICM(nn.Module):
-    def __init__(self, feat_dim=3136, num_actions=12, embed_dim=ICM_EMBED_DIM):
-        """
-        Intrinsic Curiosity Module (ICM) using pre-extracted features from DQN.
-
-        Args:
-            feat_dim (int): Dimension of pre-extracted features from DQN.
-            num_actions (int): Number of actions in the action space.
-            embed_dim (int): Dimension of the embedding space.
-        """
-        super(ICM, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_actions = num_actions
-
-        # Feature encoder: map pre-extracted features to embedding space
-        self.encoder = nn.Sequential(
-            nn.Linear(feat_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU()
-        )
-
-        # Forward model (predict next state feature)
-        self.forward_model = nn.Sequential(
-            nn.Linear(embed_dim + num_actions, 512),
-            nn.ReLU(),
-            nn.Linear(512, embed_dim)
-        )
-
-        # Inverse model (predict action)
-        self.inverse_model = nn.Sequential(
-            nn.Linear(embed_dim * 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions)
-        )
-
-    def get_feature(self, x):
-        x = self.encoder(x)
-        # Normalize features to unit L2 norm
-        x = F.normalize(x, p=2, dim=1)
-        return x
-
-    def forward(self, feat, next_feat, action):
-        # Extract features from pre-extracted DQN features
-        phi = self.get_feature(feat)
-        phi_next = self.get_feature(next_feat)
-
-        # Inverse prediction: predict action
-        inv_in = torch.cat([phi, phi_next], dim=1)
-        logits = self.inverse_model(inv_in)
-
-        # Forward prediction: predict next state feature
-        a_onehot = F.one_hot(action, self.num_actions).float()
-        fwd_in = torch.cat([phi, a_onehot], dim=1)
-        pred_phi_next = self.forward_model(fwd_in)
-
-        return logits, pred_phi_next, phi_next
-
-# Dueling Distributional Network (保持不變)
-class DuelingDistNetwork(nn.Module):
-    def __init__(self, in_channels: int, n_actions: int, atom_size: int, support: torch.Tensor):
+    def __init__(self, feature_dimension: int, n_actions: int):
         super().__init__()
-        self.support = support
-        self.n_actions = n_actions
-        self.atom_size = atom_size
-        self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
-            nn.Flatten()
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dimension, ICM_EMBED_DIM),
+            nn.ReLU(),
         )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM * 2, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM + n_actions, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, ICM_EMBED_DIM)
+        )
+
+    def forward(self, features, next_features, actions):
+        phi           = self.encoder(features)
+        phi_next      = self.encoder(next_features)
+
+        inv_input     = torch.cat([phi, phi_next], dim=1)
+        pred_action   = self.inverse_model(inv_input)
+
+        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
+        forward_input = torch.cat([phi, action_onehot], dim=1)
+        pred_phi_next = self.forward_model(forward_input)
+
+        return pred_action, pred_phi_next, phi_next
+
+# ------- Double Dueling Deep Recurrent Q Network -------
+
+class D3QN(nn.Module):
+    def __init__(self, in_channels: int, n_actions: int):
+        super().__init__()
+        self.n_actions = n_actions
+
+        self.feature_layer = nn.Sequential(
+            # Input: (BATCH_SIZE, in_channels=4, 84, 84)
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, 84, 84)
-            feat_dim = self.features(dummy).shape[1]
-        self.value_noisy = NoisyLinear(feat_dim, 512)
-        self.value = NoisyLinear(512, atom_size)
-        self.adv_noisy = NoisyLinear(feat_dim, 512)
-        self.adv = NoisyLinear(512, n_actions * atom_size)
-        self.feat_dim = feat_dim
+            self.feature_dimension  = self.feature_layer(dummy).shape[1]
+
+        self.value_layer = nn.Sequential(
+            nn.Linear(self.feature_dimension, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
+        )
+
+        self.advantage_layer = nn.Sequential(
+            nn.Linear(self.feature_dimension, 512),
+            nn.ReLU(),
+            nn.Linear(512, n_actions),
+        )
+
+        # 用 Xavier 初始化
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv2d):
+        #         nn.init.xavier_uniform_(m.weight)
+        #         m.bias.data.fill_(0.01)
 
     def forward(self, x):
-        x = self.get_features(x)
-        value = F.relu(self.value_noisy(x))
-        value = self.value(value).view(-1, 1, self.atom_size)
-        adv = F.relu(self.adv_noisy(x))
-        adv = self.adv(adv).view(-1, self.n_actions, self.atom_size)
-        q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
-        dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
-        q = (dist * self.support).sum(dim=2)
+        x         = self.feature_layer(x)
+        value     = self.value_layer(x)
+        advantage = self.advantage_layer(x)
+        q         = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
 
-    def dist(self, x):
-        x = self.get_features(x)
-        value = F.relu(self.value_noisy(x))
-        value = self.value(value).view(-1, 1, self.atom_size)
-        adv = F.relu(self.adv_noisy(x))
-        adv = self.adv(adv).view(-1, self.n_actions, self.atom_size)
-        q_atoms = value + (adv - adv.mean(dim=1, keepdim=True))
-        dist = F.softmax(q_atoms, dim=-1).clamp(min=1e-3)
-        return dist
+# ------- Agent -------
 
-    def get_features(self, x):
-        return self.features(x)
+def build_dqn_optimizer(model: nn.Module):
+    decay_params = []
+    no_decay_params = []
 
-    def reset_noise(self):
-        for m in [self.value_noisy, self.value, self.adv_noisy, self.adv]:
-            m.reset_noise()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 排除 bias 與 norm 層參數
+        if name.endswith(".bias") or "norm" in name or "bn" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
 
-# Prioritized Replay Buffer (保持不變)
-@njit
-def _compute_n_step_return(
-    rewards: np.ndarray,
-    dones: np.ndarray,
-    last_next_state: np.ndarray,
-    last_done: float,
-    gamma: float
-) -> Tuple[float, np.ndarray, float]:
-    reward = rewards[-1]
-    next_state = last_next_state
-    done = last_done
-    for i in range(len(rewards) - 2, -1, -1):
-        r = rewards[i]
-        d = dones[i]
-        reward = r + gamma * reward * (1 - d)
-        if d:
-            next_state = last_next_state
-            done = d
-    return reward, next_state, done
+    optimizer = Adam(
+        [
+            {"params": decay_params, "weight_decay": DQN_WEIGHT_DECAY},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=DQN_LEARNING_RATE,
+        eps=DQN_ADAM_EPS
+    )
+    return optimizer
 
-@njit
-def _compute_weights(p_samples: np.ndarray, size: int, beta: float, max_weight: float) -> np.ndarray:
-    weights = (p_samples * size) ** (-beta)
-    return weights / max_weight
-
-class PrioritizedReplayBuffer:
-    def __init__(self, obs_shape, size, batch_size):
-        self.obs_shape = obs_shape
-        self.max_size, self.batch_size = size, batch_size
-        self.obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
-        self.next_obs_buf = np.zeros([size] + list(obs_shape), dtype=np.float32)
-        self.acts_buf = np.zeros([size], dtype=np.int64)
-        self.rews_buf = np.zeros([size], dtype=np.float32)
-        self.done_buf = np.zeros([size], dtype=np.float32)
-        self.ptr, self.size = 0, 0
-        self.n_step_buffer = deque(maxlen=N_STEP)
-        self.max_priority, self.tree_ptr = 1.0, 0
-        tree_capacity = 1
-        while tree_capacity < size:
-            tree_capacity *= 2
-        self.sum_tree = SumSegmentTree(tree_capacity)
-        self.min_tree = MinSegmentTree(tree_capacity)
-
-    def store(self, state, action, reward, next_state, done):
-        self.n_step_buffer.append(Exp(state, action, reward, next_state, done))
-        if len(self.n_step_buffer) < N_STEP:
-            return
-        reward_n, next_state_n, done_n = self._get_n_step()
-        self.obs_buf[self.ptr] = self.n_step_buffer[0].state
-        self.acts_buf[self.ptr] = self.n_step_buffer[0].action
-        self.rews_buf[self.ptr] = reward_n
-        self.next_obs_buf[self.ptr] = next_state_n
-        self.done_buf[self.ptr] = done_n
-        self.sum_tree[self.tree_ptr] = self.max_priority ** ALPHA
-        self.min_tree[self.tree_ptr] = self.max_priority ** ALPHA
-        self.tree_ptr = (self.tree_ptr + 1) % self.max_size
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-
-    def _get_n_step(self):
-        rewards = np.array([trans.reward for trans in self.n_step_buffer], dtype=np.float32)
-        dones = np.array([trans.done for trans in self.n_step_buffer], dtype=np.float32)
-        last_next_state = self.n_step_buffer[-1].next_state
-        last_done = float(self.n_step_buffer[-1].done)
-        reward, next_state, done = _compute_n_step_return(rewards, dones, last_next_state, last_done, GAMMA)
-        return reward, next_state, done
-
-    def sample(self, frame_idx):
-        if self.size < self.batch_size:
-            return None
-        p_total = self.sum_tree.sum(0, self.size - 1)
-        p_min = self.min_tree.min() / p_total if p_total > 0 else 1.0
-        beta = get_dynamic_beta(frame_idx)
-        max_weight = (p_min * self.size) ** (-beta) if p_min > 0 else 1.0
-        indices = []
-        p_samples = []
-        for _ in range(self.batch_size):
-            mass = random.uniform(0, p_total)
-            idx = self.sum_tree.retrieve(mass)
-            indices.append(idx)
-            p_sample = self.sum_tree[idx] / p_total
-            p_samples.append(p_sample)
-        indices = np.array(indices)
-        p_samples = np.array(p_samples)
-        weights = _compute_weights(p_samples, self.size, beta, max_weight)
-        batch = Exp(
-            state=self.obs_buf[indices],
-            action=self.acts_buf[indices],
-            reward=self.rews_buf[indices],
-            next_state=self.next_obs_buf[indices],
-            done=self.done_buf[indices]
-        )
-        return batch, weights, indices
-
-    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
-        priorities = np.maximum(priorities, PRIOR_EPS)
-        priorities_alpha = priorities ** ALPHA
-        indices = np.asarray(indices, dtype=np.int32)
-        self.sum_tree.batch_update(indices, priorities_alpha)
-        self.min_tree.batch_update(indices, priorities_alpha)
-        self.max_priority = max(self.max_priority, np.max(priorities))
-
-    def get_state(self):
-        return {
-            'obs_buf': self.obs_buf,
-            'next_obs_buf': self.next_obs_buf,
-            'acts_buf': self.acts_buf,
-            'rews_buf': self.rews_buf,
-            'done_buf': self.done_buf,
-            'ptr': self.ptr,
-            'size': self.size,
-            'n_step_buffer': list(self.n_step_buffer),
-            'sum_tree': self.sum_tree.tree,
-            'min_tree': self.min_tree.tree,
-            'tree_ptr': self.tree_ptr,
-            'max_priority': self.max_priority,
-        }
-
-    def set_state(self, state):
-        self.obs_buf = state['obs_buf']
-        self.next_obs_buf = state['next_obs_buf']
-        self.acts_buf = state['acts_buf']
-        self.rews_buf = state['rews_buf']
-        self.done_buf = state['done_buf']
-        self.ptr = state['ptr']
-        self.size = state['size']
-        self.n_step_buffer = deque(state['n_step_buffer'], maxlen=N_STEP)
-        self.sum_tree.tree = state['sum_tree']
-        self.min_tree.tree = state['min_tree']
-        self.tree_ptr = state['tree_ptr']
-        self.max_priority = state['max_priority']
-
-# Agent - 改進版
 class Agent:
-    def __init__(self, obs_shape: Tuple, n_actions: int, device):
-        self.device = device
-        self.n_actions = n_actions
-        self.support = torch.linspace(V_MIN, V_MAX, ATOM_SIZE).to(device)
-        self.online = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(device)
-        self.target = DuelingDistNetwork(obs_shape[0], n_actions, ATOM_SIZE, self.support).to(device)
+    def __init__(self, obs_shape: Tuple, n_actions: int, device=None):
+        self.device         = device if device is not None else (torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.n_actions      = n_actions
+
+        self.online         = D3QN(obs_shape[0], n_actions).to(self.device)
+        self.target         = D3QN(obs_shape[0], n_actions).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
-        self.optimizer = optim.Adam(self.online.parameters(), lr=LR, eps=ADAM_EPS)
-        self.icm = ICM(feat_dim=self.online.feat_dim, num_actions=n_actions).to(device)
-        self.icm_optimizer = optim.Adam(self.icm.parameters(), lr=ICM_LR)
-        self.buffer = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE)
-        self.frame_idx = 0
-        self.rewards = []
-        self.dqn_losses = []
-        self.icm_losses = []
-        self.eval_rewards = []
-        self.int_rewards = []  # 記錄內在獎勵
-        self.best_eval_reward = -np.inf
 
-    def act(self, state):
-        s_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
+
+        # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
+        self.optimizer      = build_dqn_optimizer(self.online)
+        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE)
+
+        self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
+
+        self.dqn_criterion      = nn.MSELoss(reduction='none')
+        self.forward_criterion  = nn.MSELoss()
+        self.inverse_criterion  = nn.CrossEntropyLoss()
+
+        self.frame_idx         = 0
+        self.rewards           = []
+        self.dqn_losses        = []
+        self.forward_losses    = []
+        self.inverse_losses    = []
+        self.intrinsic_rewards = []
+        self.eval_rewards      = []
+        self.best_eval_reward  = -np.inf
+
+    def act(self, state, deterministic=False, tau=EXPLORE_TAU):
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            q = self.online(s_t)
-        return int(q.argmax(1).item())
+            q_values = self.online(state_tensor)  # Shape: (1, n_actions)
+            if deterministic:
+                # Greedy selection
+                return int(q_values.argmax(dim=1).item())
+            else:
+                # Boltzmann exploration
+                probabilities = F.softmax(q_values / tau, dim=1)
+                action = torch.multinomial(probabilities, num_samples=1).item()
+        return action
+
+    def check_parameters(self):
+        """檢查 online、target 模塊的參數值大小"""
+        models = {
+            "online": self.online,
+            "target": self.target,
+        }
+
+        max_len = len("advantage_layer.0.weight:")
+
+        for model_name, model in models.items():
+            param_stats = []
+            for name, param in model.named_parameters():
+                # 計算參數的統計值
+                param_norm = param.norm().item()  # L2 範數
+                param_mean = param.mean().item()  # 平均值
+                param_std  = param.std().item()   # 標準差
+                param_max  = param.max().item()   # 最大值
+                param_min  = param.min().item()   # 最小值
+                param_stats.append(
+                    f"{name}:{' ' * (max_len - len(name))}"
+                    f"norm={' ' if param_norm >= 0 else ''}{param_norm:02.5f},\t"
+                    f"mean={' ' if param_mean >= 0 else ''}{param_mean:.5f},\t"
+                    f"std={' ' if param_std >= 0 else ''}{param_std:.5f},\t"
+                    f"max={' ' if param_max >= 0 else ''}{param_max:.5f},\t"
+                    f"min={' ' if param_min >= 0 else ''}{param_min:.5f}"
+                )
+
+            # 打印統計信息
+            tqdm.write(f"\n[{model_name}] Parameter Statistics at Frame {self.frame_idx}:")
+            for stat in param_stats:
+                tqdm.write(stat)
+
+    def check_gradients(self):
+        """檢查梯度大小"""
+        models = {
+            "online": self.online,
+        }
+
+        max_len = len("advantage_layer.0.weight")
+
+        for model_name, model in models.items():
+            grad_stats = []
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    grad_mean = param.grad.mean().item()
+                    grad_std  = param.grad.std().item()
+                    grad_max  = param.grad.max().item()
+                    grad_min  = param.grad.min().item()
+                    grad_stats.append(
+                        f"{name}:{' ' * (max_len - len(name))}"
+                        f"grad_norm={' ' if grad_norm >= 0 else ''}{grad_norm:.5f},\t"
+                        f"grad_mean={' ' if grad_mean >= 0 else ''}{grad_mean:.5f},\t"
+                        f"grad_std={' ' if grad_std >= 0 else ''}{grad_std:.5f},\t"
+                        f"grad_max={' ' if grad_max >= 0 else ''}{grad_max:.5f},\t"
+                        f"grad_min={' ' if grad_min >= 0 else ''}{grad_min:.5f}"
+                    )
+            tqdm.write(f"\n[{model_name}] Gradient Statistics at Frame {self.frame_idx}:")
+            for stat in grad_stats:
+                tqdm.write(stat)
 
     def learn(self):
-        sample = self.buffer.sample(self.frame_idx)
-        if sample is None:
-            return None, None, None
-        batch, weights, indices = sample
-        state = torch.from_numpy(batch.state).float().to(self.device)
-        action = torch.from_numpy(batch.action).long().to(self.device)
-        r_ext = torch.from_numpy(batch.reward).float().to(self.device)
-        next_state = torch.from_numpy(batch.next_state).float().to(self.device)
-        done = torch.from_numpy(batch.done).float().to(self.device)
-        w = torch.from_numpy(weights).float().to(self.device)
+        batch       = self.buffer.sample_batch(_get_beta_by_frame(self.frame_idx))
+        states      = torch.tensor(batch['obs'], dtype=torch.float32, device=self.device)
+        actions     = torch.tensor(batch['acts'], dtype=torch.int64, device=self.device)
+        rewards     = torch.tensor(batch['rews'], dtype=torch.float32, device=self.device)
+        next_states = torch.tensor(batch['next_obs'], dtype=torch.float32, device=self.device)
+        dones       = torch.tensor(batch['done'], dtype=torch.float32, device=self.device)
+        weights     = torch.tensor(batch['weights'], dtype=torch.float32, device=self.device)
+        indices     = batch['indices']
 
-        # Extract features once for both DQN and ICM
-        feat = self.online.get_features(state)
-        next_feat = self.online.get_features(next_state)
-
-        # Compute distributional loss (without intrinsic reward)
-        curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
+        # ----- ICM -----
+        features        = self.online.feature_layer(states).detach()
+        next_features   = self.online.feature_layer(next_states).detach()
+        pred_action, pred_phi_next, phi_next = self.icm(features, next_features, actions)
+        inverse_loss    = self.inverse_criterion(pred_action, actions)
+        forward_loss    = self.forward_criterion(pred_phi_next, phi_next)
+        icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
-            next_action = self.online(next_state).argmax(1)
-            next_dist = self.target.dist(next_state)[range(BATCH_SIZE), next_action]
-            t_z = r_ext.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-            offset = torch.linspace(0, (BATCH_SIZE - 1) * ATOM_SIZE, BATCH_SIZE).long().unsqueeze(1).expand(BATCH_SIZE, ATOM_SIZE).to(self.device)
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        dqn_loss = (elementwise_loss * w).mean()
+            intrinsic_reward = ICM_ETA * forward_loss.detach()
 
-        # ICM loss (use pre-extracted features)
-        logits, pred_phi_n, true_phi_n = self.icm(feat, next_feat, action)
-        inv_loss = F.cross_entropy(logits, action)
-        fwd_loss = F.mse_loss(pred_phi_n, true_phi_n.detach())
-        icm_loss = (1 - ICM_BETA) * inv_loss + ICM_BETA * fwd_loss
-
-        # Compute intrinsic reward with dynamic eta
-        eta = get_dynamic_eta(self.frame_idx)
+        # ----- DQN -----
         with torch.no_grad():
-            int_reward = _compute_intrinsic_reward(pred_phi_n, true_phi_n, eta=eta)
+            next_actions = self.online(next_states).argmax(1)
+            q_next       = self.target(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            q_target     = rewards + intrinsic_reward + GAMMA_POW_N_STEP * q_next * (1 - dones)
+        q_predicted = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        td_value    = q_predicted - q_target.detach()
+        dqn_loss    = (self.dqn_criterion(q_predicted, q_target.detach()) * weights).mean()
 
-        # Update DQN with combined reward
-        total_r = r_ext + int_reward
-        curr_dist = self.online.dist(state)[range(BATCH_SIZE), action]
-        with torch.no_grad():
-            t_z = total_r.unsqueeze(1) + (1 - done).unsqueeze(1) * GAMMA_POW_N_STEP * self.support.unsqueeze(0)
-            t_z = t_z.clamp(min=V_MIN, max=V_MAX)
-            b = (t_z - V_MIN) / ((V_MAX - V_MIN) / (ATOM_SIZE - 1))
-            l = b.floor().long()
-            u = b.ceil().long()
-            proj_dist = torch.zeros_like(next_dist)
-            proj_dist.view(-1).index_add_(0, (l + offset).view(-1), (next_dist * (u.float() - b)).view(-1))
-            proj_dist.view(-1).index_add_(0, (u + offset).view(-1), (next_dist * (b - l.float())).view(-1))
-        log_p = torch.log(curr_dist.clamp(min=1e-3))
-        elementwise_loss = -(proj_dist * log_p).sum(1)
-        dqn_loss = (elementwise_loss * w).mean()
-
-        # Optimize DQN and ICM separately
+        # ----- Update -----
         self.optimizer.zero_grad()
         dqn_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)
+        U.clip_grad_norm_(self.online.parameters(), 5.0)
+        # U.clip_grad_value_(self.online.parameters(), 1.0)
         self.optimizer.step()
 
         self.icm_optimizer.zero_grad()
         icm_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.icm.parameters(), 10.0)
+        U.clip_grad_norm_(self.icm.parameters(), 5.0)
+        # U.clip_grad_value_(self.icm.parameters(), 1.0)
         self.icm_optimizer.step()
 
-        self.buffer.update_priorities(indices, elementwise_loss.abs().detach().cpu().numpy())
+        self.buffer.update_priorities(indices, td_value.detach().abs().cpu().numpy())
 
-        # Soft target update
-        for target_p, online_p in zip(self.target.parameters(), self.online.parameters()):
-            target_p.data.copy_(TAU * online_p.data + (1.0 - TAU) * target_p.data)
+        if self.frame_idx % TARGET_UPDATE_FRAMES == 0:
+            if TARGET_UPDATE_TAU == 1.0:
+                # Hard target update
+                self.target.load_state_dict(self.online.state_dict())
+            else:
+                # Soft target update
+                for target_param, online_param in zip(self.target.parameters(), self.online.parameters()):
+                    target_param.data.copy_(TARGET_UPDATE_TAU * online_param.data + (1.0 - TARGET_UPDATE_TAU) * target_param.data)
 
-        return dqn_loss.item(), icm_loss.item(), int_reward.mean().item()
+        return dqn_loss.item(), forward_loss.item(), inverse_loss.item(), intrinsic_reward.mean().item()
 
-    def save_model(self, path):
+    def save_model(self, path: str, dqn_only=False):
+        # 儲存主 DQN 模型
+        torch.save(self.online.state_dict(), path, pickle_protocol=4)
+        if dqn_only:
+            return
+        assert path.endswith('.pth')
+        # 儲存其他 metadata
+        meta_path = path.replace('.pth', '.meta.pth')
         torch.save({
-            'online': self.online.state_dict(),
-            'target': self.target.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'icm': self.icm.state_dict(),
-            'icm_optimizer': self.icm_optimizer.state_dict(),
-            'frame_idx': self.frame_idx,
-            'rewards': self.rewards,
-            'dqn_losses': self.dqn_losses,
-            'icm_losses': self.icm_losses,
-            'eval_rewards': self.eval_rewards,
-            'int_rewards': self.int_rewards,
-            'best_eval_reward': self.best_eval_reward,
-            'buffer_state': self.buffer.get_state(),
-        }, path, pickle_protocol=4)
+            'target'           : self.target.state_dict(),
+            # 'icm'              : self.icm.state_dict(),
+            'optimizer'        : self.optimizer.state_dict(),
+            # 'icm_optimizer'    : self.icm_optimizer.state_dict(),
+            'frame_idx'        : self.frame_idx,
+            'rewards'          : self.rewards,
+            'dqn_losses'       : self.dqn_losses,
+            'forward_losses'   : self.forward_losses,
+            'inverse_losses'   : self.inverse_losses,
+            'intrinsic_rewards': self.intrinsic_rewards,
+            'eval_rewards'     : self.eval_rewards,
+            'best_eval_reward' : self.best_eval_reward,
+            'buffer_state'     : self.buffer.get_state(),
+        }, meta_path, pickle_protocol=4)
 
-    def load_model(self, path, eval_mode=False):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.online.load_state_dict(checkpoint['online'])
-        self.target.load_state_dict(checkpoint['target'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.icm.load_state_dict(checkpoint['icm'])
-        self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
-        self.frame_idx = checkpoint['frame_idx']
-        self.rewards = checkpoint['rewards']
-        self.dqn_losses = checkpoint['dqn_losses']
-        self.icm_losses = checkpoint['icm_losses']
-        self.eval_rewards = checkpoint.get('eval_rewards', [])
-        self.int_rewards = checkpoint.get('int_rewards', [])
-        self.best_eval_reward = checkpoint.get('best_eval_reward', -np.inf)
-        self.buffer.set_state(checkpoint['buffer_state'])
+    def load_model(self, path, eval_mode=False, load_memory=True):
+        # 先載入 DQN 模型
+        self.online.load_state_dict(torch.load(path, map_location=self.device, weights_only=False))
         if eval_mode:
             self.online.eval()
-            self.icm.eval()
+            return
+        assert path.endswith('.pth')
+        # 載入 metadata
+        meta_path = path.replace('.pth', '.meta.pth')
+        checkpoint = torch.load(meta_path, map_location=self.device, weights_only=False)
+        self.target.load_state_dict(checkpoint['target'])
+        # self.icm.load_state_dict(checkpoint['icm'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        # self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
+        self.frame_idx         = checkpoint.get('frame_idx', 0)
+        self.rewards           = checkpoint.get('rewards', [])
+        self.dqn_losses        = checkpoint.get('dqn_losses', [])
+        self.forward_losses    = checkpoint.get('forward_losses', [])
+        self.inverse_losses    = checkpoint.get('inverse_losses', [])
+        self.intrinsic_rewards = checkpoint.get('intrinsic_rewards', [])
+        self.eval_rewards      = checkpoint.get('eval_rewards', [])
+        self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
+        if load_memory:
+            self.buffer.set_state(checkpoint['buffer_state'])
 
-# Training Loop - 改進版
+# ------- Training Functions -------
+
 def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(20, 8))
-    plt.subplot(221)
+    plt.figure(figsize=(20, 15))
+
+    plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-    plt.title(f"Episode {episode} | Avg Reward {avg_reward:.2f}")
-    plt.plot(agent.rewards, label='Reward')
-    plt.plot([i * EVAL_INTERVAL for i in range(1, len(agent.eval_rewards) + 1)], agent.eval_rewards, label='Eval Reward')
+    plt.title(f"Life {episode} | Avg Reward {avg_reward:.1f}")
+    plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
+    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
+    plt.xlim(left=1, right=len(agent.rewards))
+    plt.ylim(bottom=max(-1000.0, min(agent.rewards)))
     plt.legend()
 
-    plt.subplot(222)
+    plt.subplot(312)
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
-    plt.legend()
+    plt.xlim(left=0.0, right=len(agent.dqn_losses))
+    plt.ylim(bottom=0.0,top=min(50.0, np.max(agent.dqn_losses)))
+    # plt.legend()
 
-    plt.subplot(223)
-    plt.title("ICM Loss")
-    plt.plot(agent.icm_losses, label='ICM Loss')
-    plt.legend()
-
-    plt.subplot(224)
-    plt.title("Intrinsic Reward")
-    plt.plot(agent.int_rewards, label='Intrinsic Reward')
+    plt.subplot(313)
+    plt.title(f"ICM Loss | Intrinsic Reward = {ICM_ETA:.1f} x Forward Loss")
+    plt.plot(agent.inverse_losses, label='Inverse Loss')
+    plt.plot(agent.forward_losses, label='Forward Loss')
+    plt.plot(agent.intrinsic_rewards, label='Intrinsic Reward')
+    plt.xlim(left=0.0, right=len(agent.inverse_losses))
+    plt.ylim(bottom=0.0)
     plt.legend()
 
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
@@ -604,111 +414,192 @@ def plot_figure(agent: Agent, episode: int):
     plt.close()
     tqdm.write(f"Plot saved to {save_path}")
 
-def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/best.pth'):
+def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
     agent.online.eval()
-    eval_env = make_env()
-    state = eval_env.reset()
-    e_reward = 0
-    done = False
-    while not done:
-        e_action = agent.act(state)
-        state, reward, done, _ = eval_env.step(e_action)
-        e_reward += reward
-    eval_env.close()
-    agent.eval_rewards.append(e_reward)
-    if e_reward > agent.best_eval_reward:
-        agent.best_eval_reward = e_reward
-    tqdm.write(f"Eval Reward: {e_reward:.1f} | Best Eval Reward: {agent.best_eval_reward:.1f}")
 
-    if e_reward >= 4000 and e_reward == agent.best_eval_reward:
-        agent.save_model(best_checkpoint_path)
-        tqdm.write(f"Best model saved at episode {episode} with Eval Reward {e_reward:.1f}")
+    with torch.no_grad():
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, random_start=False, level=None)
+        eval_rewards = [0, 0, 0]
+        farest_x = 0
+        prev_stage = 1
+        for i in range(3):
+            state = eval_env.reset()
+            eval_reward = 0
+            done = False
+            while not done:
+                e_action = agent.act(state, deterministic=True)
+                state, reward, done, info = eval_env.step(e_action)
+                stage = info['stage']
+                if prev_stage < stage:
+                    farest_x = info['x_pos']
+                else:
+                    farest_x = max(farest_x, info['x_pos'])
+                prev_stage = stage
+                if RENDER:
+                    eval_env.render()
+                eval_reward += reward
+            eval_rewards[i] = eval_reward
+        eval_env.close()
 
-def train(num_episodes: int, checkpoint_path='models/rainbow_icm.pth', best_checkpoint_path='models/best.pth'):
-    env = make_env()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    agent = Agent(env.observation_space.shape, env.action_space.n, device)
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-    os.makedirs(PLOT_DIR, exist_ok=True)
+        total_eval_reward = sum(eval_rewards)
+        agent.eval_rewards.append(total_eval_reward)
+        if total_eval_reward > agent.best_eval_reward:
+            agent.best_eval_reward = total_eval_reward
 
-    start_ep = 1
-    if os.path.isfile(checkpoint_path):
-        agent.load_model(checkpoint_path)
-        start_ep = len(agent.rewards) + 1
+        tqdm.write(
+            f"Eval Reward: {eval_rewards[0]:.0f} + {eval_rewards[1]:.0f} + {eval_rewards[2]:.0f} = {total_eval_reward:.0f} | "
+            f"Stage {prev_stage} | "
+            f"Farest X {farest_x} | "
+            f"Best Eval Reward: {agent.best_eval_reward:.0f}"
+        )
+
+        if total_eval_reward >= 3000 and total_eval_reward == agent.best_eval_reward:
+            agent.save_model(best_checkpoint_path, dqn_only=True)
+            tqdm.write(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
 
     agent.online.train()
+
+def train(
+    agent: Agent,
+    max_episodes: int,
+    level: str=None,
+    checkpoint_path='models/d3qn_icm_epsilonboltz.pth',
+    best_checkpoint_path='models/d3qn_icm_epsilonboltz_best.pth',
+):
+    env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=False, random_start=True, level=level)
+
+    agent.online.train()
+
+    progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
+    progress_bar.update(agent.frame_idx)
 
     # Warm-up
     state = env.reset()
     while agent.buffer.size < BATCH_SIZE:
-        action = agent.act(state)
+        action = agent.act(state, deterministic=False)
         next_state, reward, done, _ = env.step(action)
         agent.buffer.store(state, action, reward, next_state, done)
         state = next_state
         if done:
             state = env.reset()
+        progress_bar.update(1)
 
-    # Training
-    progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
-    progress_bar.update(len(agent.dqn_losses))
+    start_episode = len(agent.rewards) + 1
 
-    for ep in range(start_ep, num_episodes + 1):
+    for episode in range(start_episode, max_episodes + 1):
+
         state = env.reset()
-        ep_reward, ep_env_reward, prev_x, prev_life = 0, 0, None, None
-        done = False
+        episode_reward  = 0
+        steps           = 0
+        done            = False
+        farest_x        = 0
+        prev_stage      = 1
+        prev_life       = 2
+
         while not done:
             agent.frame_idx += 1
-            action = agent.act(state)
+            steps += 1
+
+            action = agent.act(state, deterministic=(np.random.rand() >= EPSILON))
+
             next_state, reward, done, info = env.step(action)
-            truncated = info.get('TimeLimit.truncated', False)
-            done_flag = done and not truncated
-            custom_reward = reward
-            life = info['life']
-            if prev_life is None:
-                prev_life = life
-            elif life < prev_life:
-                custom_reward += DEATH_PENALTY
-                prev_life = life
-            agent.buffer.store(state, action, custom_reward, next_state, done_flag)
-            dqn_loss, icm_loss, int_reward = agent.learn()
-            if dqn_loss is not None:
-                agent.dqn_losses.append(dqn_loss)
-                agent.icm_losses.append(icm_loss)
-                agent.int_rewards.append(int_reward)
+            episode_reward += reward
+            if RENDER:
+                env.render()
+
+            x_pos        = info['x_pos']
+            stage        = info['stage']
+            life         = info['life']
+
+            if prev_stage < stage:
+                farest_x = x_pos
+            else:
+                farest_x = max(farest_x, x_pos)
+            # if life < prev_life:
+            #     done     = True
+
+            prev_stage   = stage
+            prev_life    = life
+
+            agent.buffer.store(state, action, reward, next_state, done)
             state = next_state
-            ep_env_reward += reward
+
+            dqn_loss, forward_loss, inverse_loss, int_reward = agent.learn()
+            agent.dqn_losses.append(dqn_loss)
+            agent.forward_losses.append(forward_loss)
+            agent.inverse_losses.append(inverse_loss)
+            agent.intrinsic_rewards.append(int_reward)
+
             progress_bar.update(1)
             if agent.frame_idx >= MAX_FRAMES:
                 break
 
-        agent.rewards.append(ep_env_reward)
-        status = "TERMINATED" if done_flag else "TRUNCATED"
+        agent.rewards.append(episode_reward)
+
+        # Check parameters
+        if CHECK_PARAM_INTERVAL > 0 and episode % CHECK_PARAM_INTERVAL == 0:
+            agent.check_parameters()
+
+        # Check gradients
+        if CHECK_GRAD_INTERVAL > 0 and episode % CHECK_GRAD_INTERVAL == 0:
+            agent.check_gradients()
 
         # Logging
-        if ep % PLOT_INTERVAL == 0:
-            avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
-            avg_int_r = np.mean(agent.int_rewards[-PLOT_INTERVAL:]) if len(agent.int_rewards) >= PLOT_INTERVAL else np.mean(agent.int_rewards)
-            tqdm.write(f"Episode {ep} | Reward {ep_env_reward:.1f} | Avg Reward {avg_reward:.1f} | Avg Intrinsic Reward {avg_int_r:.4f} | Stage {env.unwrapped._stage} | Status {status}")
+        tqdm.write(
+            f"Episode {episode}\t| "
+            f"Steps {steps}\t| "
+            f"Reward {episode_reward:.0f}\t| "
+            f"Stage {prev_stage} | "
+            f"Farest X {farest_x}"
+        )
 
         # Evaluation
-        if ep % EVAL_INTERVAL == 0:
-            evaluation(agent, ep, best_checkpoint_path)
-            agent.online.train()
+        if episode % EVAL_INTERVAL == 0:
+            evaluation(agent, episode, best_checkpoint_path)
 
         # Plot
-        if ep % PLOT_INTERVAL == 0:
-            plot_figure(agent, ep)
+        if episode % PLOT_INTERVAL == 0:
+            plot_figure(agent, episode)
 
         # Save model
-        if ep % SAVE_INTERVAL == 0:
+        if episode % SAVE_INTERVAL == 0:
+            avg_reward = np.mean(
+                agent.rewards[-SAVE_INTERVAL:]
+                if len(agent.rewards) >= SAVE_INTERVAL
+                else agent.rewards
+            )
+            tqdm.write(f"Avg Reward {avg_reward:.1f}")
             agent.save_model(checkpoint_path)
-            tqdm.write(f"Model saved at episode {ep}")
+            tqdm.write(f"Model saved at episode {episode}")
 
         if agent.frame_idx >= MAX_FRAMES:
-            break
+                break
 
-    progress_bar.close()
     env.close()
+    progress_bar.close()
 
 if __name__ == '__main__':
-    train(num_episodes=10000)
+    checkpoint_path='models/d3qn_icm_450.pth'
+
+    agent = Agent((4, 84, 84), 12)
+
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    if os.path.isfile(checkpoint_path):
+        agent.load_model(checkpoint_path)
+
+    # 輪流練200episode
+
+    if len(agent.rewards) < 200:
+        train(agent, max_episodes=200, level=None, checkpoint_path='models/d3qn_icm_200.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 400:
+        train(agent, max_episodes=400, level='1-2', checkpoint_path='models/d3qn_icm_400.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 500:
+        train(agent, max_episodes=500, level=None, checkpoint_path='models/d3qn_icm_500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 550:
+        train(agent, max_episodes=550, level='1-2', checkpoint_path='models/d3qn_icm_550.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
