@@ -483,7 +483,7 @@ def train(
         steps           = 0
         done            = False
         farest_x        = 0
-        stage           = 1
+        prev_stage      = 1
         prev_life       = 2
 
         while not done:
@@ -497,12 +497,19 @@ def train(
             if RENDER:
                 env.render()
 
-            farest_x = max(farest_x, info['x_pos'])
-            stage = info['stage']
-            life = info['life']
+            x_pos        = info['x_pos']
+            stage        = info['stage']
+            life         = info['life']
+
+            if prev_stage < stage:
+                farest_x = x_pos
+            else:
+                farest_x = max(farest_x, x_pos)
             if life < prev_life:
-                done = True
-            prev_life = life
+                done     = True
+
+            prev_stage   = stage
+            prev_life    = life
 
             agent.buffer.store(state, action, reward, next_state, done)
             state = next_state
@@ -528,7 +535,7 @@ def train(
             f"Episode {episode}\t| "
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
-            f"Stage {stage} | "
+            f"Stage {prev_stage} | "
             f"Farest X {farest_x}"
         )
 
