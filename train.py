@@ -49,11 +49,11 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
-EVAL_INTERVAL           = 30
-SAVE_INTERVAL           = 300
-PLOT_INTERVAL           = 30
-CHECK_PARAM_INTERVAL    = 150
-CHECK_GRAD_INTERVAL     = 150
+EVAL_INTERVAL           = 10
+SAVE_INTERVAL           = 100
+PLOT_INTERVAL           = 10
+CHECK_PARAM_INTERVAL    = 50
+CHECK_GRAD_INTERVAL     = 50
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
@@ -357,7 +357,7 @@ class Agent:
 
     def load_model(self, path, eval_mode=False):
         # 先載入 DQN 模型
-        self.online.load_state_dict(torch.load(path, map_location=self.device), weights_only=True)
+        self.online.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
         if eval_mode:
             self.online.eval()
             return
@@ -385,37 +385,27 @@ class Agent:
 def plot_figure(agent: Agent, episode: int):
     plt.figure(figsize=(24, 10))
 
-    plt.subplot(221)
+    plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Life {episode} | Avg Reward {avg_reward:.1f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
+    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL // 3, agent.eval_rewards, label='Eval Reward')
     plt.xlim(left=1, right=len(agent.rewards))
     plt.ylim(bottom=max(-1000.0, min(agent.rewards)))
     plt.legend()
 
-    arr = np.array(agent.rewards)
-    # 補 0 讓長度是3的倍數
-    if len(arr) % 3 != 0:
-        arr = np.pad(arr, (0, 3 - len(arr) % 3))
-    episode_rewards = arr.reshape(-1, 3).sum(axis=1)
-
-    plt.subplot(223)
-    avg_reward = np.mean(episode_rewards[-PLOT_INTERVAL//3:]) if len(episode_rewards) >= PLOT_INTERVAL // 3 else np.mean(episode_rewards)
-    plt.title(f"Episode {episode // 3} | Avg Reward {avg_reward:.1f}")
-    plt.plot(1 + np.arange(len(episode_rewards)), episode_rewards, label='Reward')
-    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL // 3, agent.eval_rewards, label='Eval Reward')
-    plt.xlim(left=1, right=len(episode_rewards))
-    plt.ylim(bottom=max(-1000.0, min(min(episode_rewards), min(agent.eval_rewards))))
-    plt.legend()
-
-    plt.subplot(222)
+    plt.subplot(312)
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=np.max(agent.dqn_losses[-int(len(agent.dqn_losses) // 2):] if len(agent.rewards) >= PLOT_INTERVAL else agent.dqn_losses))
+    plt.ylim(bottom=0.0,top=np.max(
+        agent.dqn_losses[-int(len(agent.dqn_losses) // 2):]
+        if len(agent.rewards) >= PLOT_INTERVAL else
+        agent.dqn_losses
+    ))
     # plt.legend()
 
-    plt.subplot(224)
+    plt.subplot(313)
     plt.title(f"ICM Loss | Intrinsic Reward = {ICM_ETA:.1f} x Forward Loss")
     plt.plot(agent.inverse_losses, label='Inverse Loss')
     plt.plot(agent.forward_losses, label='Forward Loss')
@@ -564,7 +554,7 @@ def train(
     env.close()
 
 if __name__ == '__main__':
-    checkpoint_path='models/d3qn_icm_lv1.pth'
+    checkpoint_path='models/d3qn_icm.pth'
 
     agent = Agent((4, 84, 84), 12)
 
@@ -573,8 +563,10 @@ if __name__ == '__main__':
     if os.path.isfile(checkpoint_path):
         agent.load_model(checkpoint_path)
 
+    train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
     # train each level 3000 episodes
-    train(agent, max_episodes=3000, level='1-1', checkpoint_path='models/d3qn_icm_lv1.pth')
+    # train(agent, max_episodes=3000, level='1-1', checkpoint_path='models/d3qn_icm_lv1.pth')
     # train(agent, max_episodes=6000, level='1-2')
     # ep = 6000
     # for _ in range(10):
