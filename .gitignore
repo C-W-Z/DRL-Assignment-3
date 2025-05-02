@@ -8,9 +8,12 @@ models
 plots
 human_play
 icm_ckpt
+checkpoints
 
 *log*
 *rainbow*
 convert.py
 trajectory2play.py
 clean_trajectory.py
+train2.py
+duelicm.py
