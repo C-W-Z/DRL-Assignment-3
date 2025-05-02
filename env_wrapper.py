@@ -4,6 +4,9 @@ from nes_py.wrappers import JoypadSpace
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 import numpy as np
+from torchvision import transforms as T
+from collections import deque
+from gym.wrappers import TimeLimit
 
 class NoopResetEnv(gym.Wrapper):
     """
@@ -61,8 +64,7 @@ class SkipAndMax(gym.Wrapper):
         done = None
         for i in range(self._skip):
             obs, reward, done, info = self.env.step(action)
-            if i >= self._skip - 2:
-                self._obs_buffer[i & 1] = np.asarray(obs)
+            self._obs_buffer[i & 1] = np.asarray(obs)
             total_reward += reward
             if done:
                 break
@@ -95,6 +97,22 @@ class LifeEpisode(gym.Wrapper):
         self.lives = getattr(self.env.unwrapped, '_life', 2)
         return obs
 
+class GrayScaleResize(gym.ObservationWrapper):
+    """Converts observations to grayscale and resizes them."""
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Grayscale(),
+            T.Resize((84, 84)),
+            T.ToTensor()
+        ])
+        self.observation_space = gym.spaces.Box(0.0, 1.0, shape=(1, 84, 84), dtype=np.float32)
+
+    def observation(self, obs: np.ndarray):
+        """Applies the grayscale and resize transformations to the observation."""
+        return self.transform(obs)
+
 class FrameProcessing(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -118,39 +136,63 @@ class FrameProcessing(gym.ObservationWrapper):
         return frame.astype(np.float32)[np.newaxis, :, :] / 255.0
         # assert frame.shape == (1, 84, 84)
 
+# class FrameStack(gym.Wrapper):
+#     def __init__(self, env, n_steps=4):
+#         super().__init__(env)
+#         self.n_steps = n_steps
+#         shp = env.observation_space.shape
+#         self.observation_space = gym.spaces.Box(0, 1, shape=(n_steps * shp[0], shp[1], shp[2]), dtype=np.float32)
+#         self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
+
+#     def reset(self):
+#         obs = self.env.reset()
+#         obs = np.asarray(obs)
+#         for i in range(self.n_steps):
+#             self.frames[i] = obs
+#         return self.frames
+
+#     def step(self, action):
+#         obs, reward, done, info = self.env.step(action)
+#         obs = np.asarray(obs)
+#         self.frames[:-1] = self.frames[1:]
+#         self.frames[-1] = obs
+#         return self.frames, reward, done, info
+
 class FrameStack(gym.Wrapper):
-    def __init__(self, env, n_steps=4):
+    """Stacks the last k observations along the channel dimension."""
+    def __init__(self, env: gym.Env, k: int):
         super().__init__(env)
-        self.n_steps = n_steps
+        self.k = k
+        self.frames = deque(maxlen=k)
         shp = env.observation_space.shape
-        self.observation_space = gym.spaces.Box(0, 1, shape=(n_steps * shp[0], shp[1], shp[2]), dtype=np.float32)
-        self.frames = np.zeros(self.observation_space.shape, dtype=np.float32)
+        self.observation_space = gym.spaces.Box(0, 1, shape=(shp[0] * k, shp[1], shp[2]), dtype=np.float32)
 
-    def reset(self):
+    def reset(self) -> np.ndarray:
+        """Resets the environment and fills the frame stack with the initial observation."""
         obs = self.env.reset()
-        obs = np.asarray(obs)
-        for i in range(self.n_steps):
-            self.frames[i] = obs
-        return self.frames
+        for _ in range(self.k):
+            self.frames.append(obs)
+        return np.concatenate(self.frames, axis=0)
 
-    def step(self, action):
+    def step(self, action: int):
+        """Steps the environment and updates the frame stack."""
         obs, reward, done, info = self.env.step(action)
-        obs = np.asarray(obs)
-        self.frames[:-1] = self.frames[1:]
-        self.frames[-1] = obs
-        return self.frames, reward, done, info
+        self.frames.append(obs)
+        return np.concatenate(self.frames, axis=0), reward, done, info
 
 def make_env(skip_frames=4, stack_frames=4, life_episode=True, level: str=None):
     env = gym_super_mario_bros.make(f'SuperMarioBros-{level}-v0' if level else 'SuperMarioBros-v0')
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = NoopResetEnv(env)
+    # env = NoopResetEnv(env)
     # if random_start:
     #     env = RandomStartEnv(env, random_steps=4)
     env = SkipAndMax(env, skip=skip_frames)
     if life_episode:
         env = LifeEpisode(env)
-    env = FrameProcessing(env) # (1, 84, 84)
-    env = FrameStack(env, n_steps=stack_frames) # (4, 84, 84)
+    env = FrameProcessing(env) # (1, 84, 84) [0.0, 1.0]
+    # env = GrayScaleResize(env)
+    env = FrameStack(env, k=stack_frames) # (4, 84, 84)
+    # env = TimeLimit(env, 3000)
     return env
 
 if __name__ == "__main__":

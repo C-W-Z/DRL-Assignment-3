@@ -62,39 +62,6 @@ PLOT_DIR                = "./plots"
 def _get_beta_by_frame(frame_idx: int):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
 
-# ------- Intrinsic Curiosity Module -------
-
-class ICM(nn.Module):
-    def __init__(self, feature_dimension: int, n_actions: int, embed_dimension: int=ICM_EMBED_DIM):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(feature_dimension, embed_dimension),
-            nn.ReLU(),
-        )
-        self.inverse_model = nn.Sequential(
-            nn.Linear(embed_dimension * 2, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, n_actions)
-        )
-        self.forward_model = nn.Sequential(
-            nn.Linear(embed_dimension + n_actions, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, embed_dimension)
-        )
-
-    def forward(self, features, next_features, actions):
-        phi           = self.encoder(features)
-        phi_next      = self.encoder(next_features)
-
-        inv_input     = torch.cat([phi, phi_next], dim=1)
-        pred_action   = self.inverse_model(inv_input)
-
-        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
-        forward_input = torch.cat([phi, action_onehot], dim=1)
-        pred_phi_next = self.forward_model(forward_input)
-
-        return pred_action, pred_phi_next, phi_next
-
 # ------- Double Dueling Deep Recurrent Q Network -------
 
 class D3QN(nn.Module):
@@ -130,10 +97,28 @@ class D3QN(nn.Module):
         )
 
         # 使用 Xavier 初始化
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.xavier_uniform_(m.weight)
-                m.bias.data.fill_(0.01)
+        # for m in self.modules():
+        #     if isinstance(m, nn.Conv2d):
+        #         nn.init.xavier_uniform_(m.weight)
+        #         m.bias.data.fill_(0.01)
+
+        # ----- ICM -----
+        self.feature_size = 256
+        self.encoder = nn.Sequential(
+            self.feature_layer,
+            nn.Linear(self.feature_dimension, ICM_EMBED_DIM),
+            nn.ReLU(),
+        )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM * 2, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM + n_actions, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, ICM_EMBED_DIM)
+        )
 
     def forward(self, x):
         x         = self.feature_layer(x)
@@ -141,6 +126,19 @@ class D3QN(nn.Module):
         advantage = self.advantage_layer(x)
         q         = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
+
+    def icm(self, states, next_states, actions):
+        phi           = self.encoder(states)
+        phi_next      = self.encoder(next_states)
+
+        inv_input     = torch.cat([phi, phi_next], dim=1)
+        pred_action   = self.inverse_model(inv_input)
+
+        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
+        forward_input = torch.cat([phi, action_onehot], dim=1)
+        pred_phi_next = self.forward_model(forward_input)
+
+        return pred_action, pred_phi_next, phi_next
 
 # ------- Agent -------
 
@@ -176,8 +174,6 @@ class Agent:
         self.target         = D3QN(obs_shape[0], n_actions).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
-
-        self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
 
         # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
         self.optimizer      = build_dqn_optimizer(self.online)
@@ -215,7 +211,6 @@ class Agent:
         models = {
             "online": self.online,
             "target": self.target,
-            "icm": self.icm
         }
 
         max_len = len("advantage_layer.0.weight:")
@@ -247,7 +242,6 @@ class Agent:
         """檢查梯度大小"""
         models = {
             "online": self.online,
-            "icm": self.icm
         }
 
         max_len = len("advantage_layer.0.weight")
@@ -284,12 +278,10 @@ class Agent:
         indices     = batch['indices']
 
         # ----- ICM -----
-        features        = self.online.feature_layer(states).detach()
-        next_features   = self.online.feature_layer(next_states).detach()
-        pred_action, pred_phi_next, phi_next = self.icm(features, next_features, actions)
+        pred_action, pred_phi_next, phi_next = self.online.icm(states, next_states, actions)
         inverse_loss    = self.inverse_criterion(pred_action, actions)
-        forward_loss    = self.forward_criterion(pred_phi_next, phi_next.detach())
-        icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
+        forward_loss    = self.forward_criterion(pred_phi_next, phi_next)
+        # icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
             intrinsic_reward = ICM_ETA * forward_loss.detach()
 
@@ -304,13 +296,15 @@ class Agent:
 
         # ----- Update -----
         self.optimizer.zero_grad()
-        (0.2 * dqn_loss + icm_loss).backward()
-        U.clip_grad_norm_(self.online.parameters(), 5.0)
-        U.clip_grad_norm_(self.icm.parameters(), 5.0)
+        loss = 0.2 * dqn_loss + (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
+        loss.backward()
+        # (0.2 * dqn_loss + icm_loss).backward()
+        # U.clip_grad_norm_(self.online.parameters(), 5.0)
+        # U.clip_grad_norm_(self.icm.parameters(), 5.0)
         # U.clip_grad_value_(self.online.parameters(), 1.0)
         self.optimizer.step()
 
-        self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
+        self.buffer.update_priorities(indices, td_value.detach().abs().cpu().numpy())
 
         if self.frame_idx % TARGET_UPDATE_FRAMES == 0:
             if TARGET_UPDATE_TAU == 1.0:
@@ -391,8 +385,8 @@ def plot_figure(agent: Agent, episode: int):
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
     plt.ylim(bottom=0.0,top=np.max(
-        agent.dqn_losses[-int(len(agent.dqn_losses) // 2):]
-        if len(agent.rewards) >= PLOT_INTERVAL else
+        # agent.dqn_losses[-int(len(agent.dqn_losses) // 2):]
+        # if len(agent.rewards) >= PLOT_INTERVAL else
         agent.dqn_losses
     ))
     # plt.legend()
