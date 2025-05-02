@@ -33,14 +33,14 @@ DQN_WEIGHT_DECAY        = 1e-6
 ICM_BETA                = 0.2
 ICM_ETA                 = 1.0
 ICM_EMBED_DIM           = 256
-ICM_LEARNING_RATE       = 5e-4
+ICM_LEARNING_RATE       = 2.5e-4
 
 # Epsilon Boltzmann Exploration
 EPSILON                 = 0.1
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
-MEMORY_SIZE             = 50_000
+MEMORY_SIZE             = 30_000
 BATCH_SIZE              = 64
 GAMMA                   = 0.9
 N_STEP                  = 5
@@ -242,9 +242,9 @@ class Agent:
                 )
 
             # 打印統計信息
-            print(f"\n[{model_name}] Parameter Statistics at Frame {self.frame_idx}:")
+            tqdm.write(f"\n[{model_name}] Parameter Statistics at Frame {self.frame_idx}:")
             for stat in param_stats:
-                print(stat)
+                tqdm.write(stat)
 
     def check_gradients(self):
         """檢查梯度大小"""
@@ -271,9 +271,9 @@ class Agent:
                         f"grad_max={' ' if grad_max >= 0 else ''}{grad_max:.5f},\t"
                         f"grad_min={' ' if grad_min >= 0 else ''}{grad_min:.5f}"
                     )
-            print(f"\n[{model_name}] Gradient Statistics at Frame {self.frame_idx}:")
+            tqdm.write(f"\n[{model_name}] Gradient Statistics at Frame {self.frame_idx}:")
             for stat in grad_stats:
-                print(stat)
+                tqdm.write(stat)
 
     def learn(self):
         batch       = self.buffer.sample_batch(_get_beta_by_frame(self.frame_idx))
@@ -411,7 +411,7 @@ def plot_figure(agent: Agent, episode: int):
     save_path = os.path.join(PLOT_DIR, f"episode_{episode}.png")
     plt.savefig(save_path, bbox_inches='tight')
     plt.close()
-    print(f"Plot saved to {save_path}")
+    tqdm.write(f"Plot saved to {save_path}")
 
 def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per_bolzman_best.pth'):
     agent.online.eval()
@@ -420,6 +420,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
         eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, random_start=False, level=None)
         eval_rewards = [0, 0, 0]
         farest_x = 0
+        prev_stage = 1
         for i in range(3):
             state = eval_env.reset()
             eval_reward = 0
@@ -427,7 +428,12 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
             while not done:
                 e_action = agent.act(state, deterministic=True)
                 state, reward, done, info = eval_env.step(e_action)
-                farest_x = max(farest_x, info['x_pos'])
+                stage = info['stage']
+                if prev_stage < stage:
+                    farest_x = info['x_pos']
+                else:
+                    farest_x = max(farest_x, info['x_pos'])
+                prev_stage = stage
                 if RENDER:
                     eval_env.render()
                 eval_reward += reward
@@ -439,15 +445,16 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
         if total_eval_reward > agent.best_eval_reward:
             agent.best_eval_reward = total_eval_reward
 
-        print(
+        tqdm.write(
             f"Eval Reward: {eval_rewards[0]:.0f} + {eval_rewards[1]:.0f} + {eval_rewards[2]:.0f} = {total_eval_reward:.0f} | "
+            f"Stage {prev_stage} | "
             f"Farest X {farest_x} | "
             f"Best Eval Reward: {agent.best_eval_reward:.0f}"
         )
 
         if total_eval_reward >= 3000 and total_eval_reward == agent.best_eval_reward:
             agent.save_model(best_checkpoint_path, dqn_only=True)
-            print(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
+            tqdm.write(f"Best model saved at episode {episode} with Eval Reward {total_eval_reward:.0f}")
 
     agent.online.train()
 
@@ -474,6 +481,7 @@ def train(
         state = next_state
         if done:
             state = env.reset()
+        progress_bar.update(1)
 
     start_episode = len(agent.rewards) + 1
 
@@ -536,7 +544,7 @@ def train(
             agent.check_gradients()
 
         # Logging
-        print(
+        tqdm.write(
             f"Episode {episode}\t| "
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
@@ -559,9 +567,9 @@ def train(
                 if len(agent.rewards) >= SAVE_INTERVAL
                 else agent.rewards
             )
-            print(f"Avg Reward {avg_reward:.1f} | ")
+            tqdm.write(f"Avg Reward {avg_reward:.1f}")
             agent.save_model(checkpoint_path)
-            print(f"Model saved at episode {episode}")
+            tqdm.write(f"Model saved at episode {episode}")
 
         if agent.frame_idx >= MAX_FRAMES:
                 break
