@@ -23,14 +23,15 @@ STACK_FRAMES            = 4
 # DQN
 TARGET_UPDATE_FRAMES    = 5
 TARGET_UPDATE_TAU       = 1e-3
-DQN_LEARNING_RATE       = 5e-4
+DQN_LEARNING_RATE       = 2.5e-4
 DQN_ADAM_EPS            = 1.5e-4
-DQN_WEIGHT_DECAY        = 0
+DQN_WEIGHT_DECAY        = 1e-6
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
 ICM_ETA                 = 1.0
 ICM_EMBED_DIM           = 256
+ICM_LEARNING_RATE       = 5e-4
 
 # Epsilon Boltzmann Exploration
 EPSILON                 = 0.1
@@ -61,6 +62,39 @@ PLOT_DIR                = "./plots"
 @njit
 def _get_beta_by_frame(frame_idx: int):
     return min(1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES)
+
+# ------- Intrinsic Curiosity Module -------
+
+class ICM(nn.Module):
+    def __init__(self, feature_dimension: int, n_actions: int):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(feature_dimension, ICM_EMBED_DIM),
+            nn.ReLU(),
+        )
+        self.inverse_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM * 2, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.forward_model = nn.Sequential(
+            nn.Linear(ICM_EMBED_DIM + n_actions, 512),
+            nn.LeakyReLU(),
+            nn.Linear(512, ICM_EMBED_DIM)
+        )
+
+    def forward(self, features, next_features, actions):
+        phi           = self.encoder(features)
+        phi_next      = self.encoder(next_features)
+
+        inv_input     = torch.cat([phi, phi_next], dim=1)
+        pred_action   = self.inverse_model(inv_input)
+
+        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
+        forward_input = torch.cat([phi, action_onehot], dim=1)
+        pred_phi_next = self.forward_model(forward_input)
+
+        return pred_action, pred_phi_next, phi_next
 
 # ------- Double Dueling Deep Recurrent Q Network -------
 
@@ -96,29 +130,11 @@ class D3QN(nn.Module):
             nn.Linear(512, n_actions),
         )
 
-        # 使用 Xavier 初始化
+        # 用 Xavier 初始化
         # for m in self.modules():
         #     if isinstance(m, nn.Conv2d):
         #         nn.init.xavier_uniform_(m.weight)
         #         m.bias.data.fill_(0.01)
-
-        # ----- ICM -----
-        self.feature_size = 256
-        self.encoder = nn.Sequential(
-            self.feature_layer,
-            nn.Linear(self.feature_dimension, ICM_EMBED_DIM),
-            nn.ReLU(),
-        )
-        self.inverse_model = nn.Sequential(
-            nn.Linear(ICM_EMBED_DIM * 2, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, n_actions)
-        )
-        self.forward_model = nn.Sequential(
-            nn.Linear(ICM_EMBED_DIM + n_actions, 512),
-            nn.LeakyReLU(),
-            nn.Linear(512, ICM_EMBED_DIM)
-        )
 
     def forward(self, x):
         x         = self.feature_layer(x)
@@ -126,19 +142,6 @@ class D3QN(nn.Module):
         advantage = self.advantage_layer(x)
         q         = value + advantage - advantage.mean(dim=1, keepdim=True)
         return q
-
-    def icm(self, states, next_states, actions):
-        phi           = self.encoder(states)
-        phi_next      = self.encoder(next_states)
-
-        inv_input     = torch.cat([phi, phi_next], dim=1)
-        pred_action   = self.inverse_model(inv_input)
-
-        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
-        forward_input = torch.cat([phi, action_onehot], dim=1)
-        pred_phi_next = self.forward_model(forward_input)
-
-        return pred_action, pred_phi_next, phi_next
 
 # ------- Agent -------
 
@@ -175,8 +178,11 @@ class Agent:
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 
+        self.icm            = ICM(self.online.feature_dimension, n_actions).to(self.device)
+
         # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
         self.optimizer      = build_dqn_optimizer(self.online)
+        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE)
 
         self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
@@ -278,10 +284,12 @@ class Agent:
         indices     = batch['indices']
 
         # ----- ICM -----
-        pred_action, pred_phi_next, phi_next = self.online.icm(states, next_states, actions)
+        features        = self.online.feature_layer(states).detach()
+        next_features   = self.online.feature_layer(next_states).detach()
+        pred_action, pred_phi_next, phi_next = self.icm(features, next_features, actions)
         inverse_loss    = self.inverse_criterion(pred_action, actions)
         forward_loss    = self.forward_criterion(pred_phi_next, phi_next)
-        # icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
+        icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
             intrinsic_reward = ICM_ETA * forward_loss.detach()
 
@@ -296,13 +304,16 @@ class Agent:
 
         # ----- Update -----
         self.optimizer.zero_grad()
-        loss = 0.2 * dqn_loss + (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
-        loss.backward()
-        # (0.2 * dqn_loss + icm_loss).backward()
-        # U.clip_grad_norm_(self.online.parameters(), 5.0)
-        # U.clip_grad_norm_(self.icm.parameters(), 5.0)
+        dqn_loss.backward()
+        U.clip_grad_norm_(self.online.parameters(), 5.0)
         # U.clip_grad_value_(self.online.parameters(), 1.0)
         self.optimizer.step()
+
+        self.icm_optimizer.zero_grad()
+        icm_loss.backward()
+        U.clip_grad_norm_(self.icm.parameters(), 5.0)
+        # U.clip_grad_value_(self.icm.parameters(), 1.0)
+        self.icm_optimizer.step()
 
         self.buffer.update_priorities(indices, td_value.detach().abs().cpu().numpy())
 
@@ -364,7 +375,6 @@ class Agent:
         self.eval_rewards      = checkpoint.get('eval_rewards', [])
         self.best_eval_reward  = checkpoint.get('best_eval_reward', -np.inf)
         self.buffer.set_state(checkpoint['buffer_state'])
-
 
 # ------- Training Functions -------
 
@@ -518,7 +528,7 @@ def train(
             f"Episode {episode}\t| "
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
-            f"Stage {stage}\t| "
+            f"Stage {stage} | "
             f"Farest X {farest_x}"
         )
 
