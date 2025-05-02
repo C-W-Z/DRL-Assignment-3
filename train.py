@@ -23,15 +23,14 @@ STACK_FRAMES            = 4
 # DQN
 TARGET_UPDATE_FRAMES    = 5
 TARGET_UPDATE_TAU       = 1e-3
-DQN_LEARNING_RATE       = 1e-4
+DQN_LEARNING_RATE       = 5e-4
 DQN_ADAM_EPS            = 1.5e-4
-DQN_WEIGHT_DECAY        = 1e-6
+DQN_WEIGHT_DECAY        = 0
 
 # Intrinsic Curiosity Module
 ICM_BETA                = 0.2
 ICM_ETA                 = 1.0
 ICM_EMBED_DIM           = 256
-ICM_LEARNING_RATE       = 5e-4
 
 # Epsilon Boltzmann Exploration
 EPSILON                 = 0.1
@@ -182,7 +181,6 @@ class Agent:
 
         # self.optimizer      = Adam(self.online.parameters(), lr=DQN_LEARNING_RATE, eps=DQN_ADAM_EPS, weight_decay=DQN_WEIGHT_DECAY)
         self.optimizer      = build_dqn_optimizer(self.online)
-        self.icm_optimizer  = Adam(self.icm.parameters(), lr=ICM_LEARNING_RATE, weight_decay=DQN_WEIGHT_DECAY)
 
         self.buffer         = PrioritizedReplayBuffer(obs_shape, MEMORY_SIZE, BATCH_SIZE, ALPHA, N_STEP, GAMMA, PRIOR_EPS)
 
@@ -306,17 +304,11 @@ class Agent:
 
         # ----- Update -----
         self.optimizer.zero_grad()
-        dqn_loss.backward()
+        (0.2 * dqn_loss + icm_loss).backward()
         U.clip_grad_norm_(self.online.parameters(), 5.0)
-        # U.clip_grad_value_(self.online.parameters(), 1.0)
-
-        self.optimizer.step()
-
-        self.icm_optimizer.zero_grad()
-        icm_loss.backward()
         U.clip_grad_norm_(self.icm.parameters(), 5.0)
-        # U.clip_grad_value_(self.icm.parameters(), 1.0)
-        self.icm_optimizer.step()
+        # U.clip_grad_value_(self.online.parameters(), 1.0)
+        self.optimizer.step()
 
         self.buffer.update_priorities(indices, td_value.abs().detach().cpu().numpy())
 
@@ -343,7 +335,7 @@ class Agent:
             'target'           : self.target.state_dict(),
             'icm'              : self.icm.state_dict(),
             'optimizer'        : self.optimizer.state_dict(),
-            'icm_optimizer'    : self.icm_optimizer.state_dict(),
+            # 'icm_optimizer'    : self.icm_optimizer.state_dict(),
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
             'dqn_losses'       : self.dqn_losses,
@@ -368,7 +360,7 @@ class Agent:
         self.target.load_state_dict(checkpoint['target'])
         self.icm.load_state_dict(checkpoint['icm'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
+        # self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
         self.frame_idx         = checkpoint.get('frame_idx', 0)
         self.rewards           = checkpoint.get('rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
@@ -383,13 +375,13 @@ class Agent:
 # ------- Training Functions -------
 
 def plot_figure(agent: Agent, episode: int):
-    plt.figure(figsize=(24, 10))
+    plt.figure(figsize=(20, 15))
 
     plt.subplot(311)
     avg_reward = np.mean(agent.rewards[-PLOT_INTERVAL:]) if len(agent.rewards) >= PLOT_INTERVAL else np.mean(agent.rewards)
     plt.title(f"Life {episode} | Avg Reward {avg_reward:.1f}")
     plt.plot(1 + np.arange(len(agent.rewards)), agent.rewards, label='Reward')
-    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL // 3, agent.eval_rewards, label='Eval Reward')
+    plt.plot((1 + np.arange(len(agent.eval_rewards))) * EVAL_INTERVAL, agent.eval_rewards, label='Eval Reward')
     plt.xlim(left=1, right=len(agent.rewards))
     plt.ylim(bottom=max(-1000.0, min(agent.rewards)))
     plt.legend()
