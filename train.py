@@ -10,19 +10,21 @@ from torch.optim import Adam
 from numba import njit
 from env_wrapper import make_env
 from per import PrioritizedReplayBuffer
+from tqdm import tqdm
 
 # -----------------------------
 # Hyperparameters
 # -----------------------------
 RENDER                  = False
+MAX_FRAMES              = 10_000_000
 
 # Env Wrappers
 SKIP_FRAMES             = 4
 STACK_FRAMES            = 4
 
 # DQN
-TARGET_UPDATE_FRAMES    = 5
-TARGET_UPDATE_TAU       = 1e-3
+TARGET_UPDATE_FRAMES    = 500
+TARGET_UPDATE_TAU       = 0.1
 DQN_LEARNING_RATE       = 2.5e-4
 DQN_ADAM_EPS            = 1.5e-4
 DQN_WEIGHT_DECAY        = 1e-6
@@ -34,13 +36,13 @@ ICM_EMBED_DIM           = 256
 ICM_LEARNING_RATE       = 5e-4
 
 # Epsilon Boltzmann Exploration
-EPSILON                 = 0.05 # 0.1 before 300 lives, 0.05 after
+EPSILON                 = 0.1
 EXPLORE_TAU             = 1.0
 
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 50_000
 BATCH_SIZE              = 64
-GAMMA                   = 0.95
+GAMMA                   = 0.9
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
@@ -49,11 +51,11 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
-EVAL_INTERVAL           = 30
-SAVE_INTERVAL           = 150
-PLOT_INTERVAL           = 30
-CHECK_PARAM_INTERVAL    = 150
-CHECK_GRAD_INTERVAL     = 150
+EVAL_INTERVAL           = 10
+SAVE_INTERVAL           = 100
+PLOT_INTERVAL           = 10
+CHECK_PARAM_INTERVAL    = 50
+CHECK_GRAD_INTERVAL     = 50
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
@@ -394,11 +396,7 @@ def plot_figure(agent: Agent, episode: int):
     plt.title("DQN Loss")
     plt.plot(agent.dqn_losses, label='DQN Loss')
     plt.xlim(left=0.0, right=len(agent.dqn_losses))
-    plt.ylim(bottom=0.0,top=np.max(
-        # agent.dqn_losses[-int(len(agent.dqn_losses) // 2):]
-        # if len(agent.rewards) >= PLOT_INTERVAL else
-        agent.dqn_losses
-    ))
+    plt.ylim(bottom=0.0,top=min(50.0, np.max(agent.dqn_losses)))
     # plt.legend()
 
     plt.subplot(313)
@@ -419,7 +417,7 @@ def evaluation(agent: Agent, episode: int, best_checkpoint_path='models/d3qn_per
     agent.online.eval()
 
     with torch.no_grad():
-        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, random_start=True, level=None)
+        eval_env = make_env(SKIP_FRAMES, STACK_FRAMES, life_episode=True, random_start=False, level=None)
         eval_rewards = [0, 0, 0]
         farest_x = 0
         for i in range(3):
@@ -464,6 +462,9 @@ def train(
 
     agent.online.train()
 
+    progress_bar = tqdm(total=MAX_FRAMES, desc="Training")
+    progress_bar.update(agent.frame_idx)
+
     # Warm-up
     state = env.reset()
     while agent.buffer.size < BATCH_SIZE:
@@ -505,8 +506,8 @@ def train(
                 farest_x = x_pos
             else:
                 farest_x = max(farest_x, x_pos)
-            if life < prev_life:
-                done     = True
+            # if life < prev_life:
+            #     done     = True
 
             prev_stage   = stage
             prev_life    = life
@@ -519,6 +520,10 @@ def train(
             agent.forward_losses.append(forward_loss)
             agent.inverse_losses.append(inverse_loss)
             agent.intrinsic_rewards.append(int_reward)
+
+            progress_bar.update(1)
+            if agent.frame_idx >= MAX_FRAMES:
+                break
 
         agent.rewards.append(episode_reward)
 
@@ -558,7 +563,11 @@ def train(
             agent.save_model(checkpoint_path)
             print(f"Model saved at episode {episode}")
 
+        if agent.frame_idx >= MAX_FRAMES:
+                break
+
     env.close()
+    progress_bar.close()
 
 if __name__ == '__main__':
     checkpoint_path='models/d3qn_icm.pth'

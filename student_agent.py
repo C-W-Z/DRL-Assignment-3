@@ -11,8 +11,8 @@ class Agent(object):
         self.agent.online = torch.jit.script(self.agent.online) # 加速推理
 
         # Skipframe 參數
-        self.skip_counter = 0
         self.last_action  = 0
+        self.frame_count  = 0
 
         # 初始化 SkipAndMax 的緩衝區
         self.obs_buffer = deque(maxlen=2)
@@ -27,20 +27,16 @@ class Agent(object):
         while len(self.obs_buffer) < 2:
             self.obs_buffer.append(observation)
 
-        if self.skip_counter > 0:
-            self.skip_counter -= 1
-            return self.last_action
+        if self.frame_count % SKIP_FRAMES == 0:
+            max_frame = np.max(np.stack(self.obs_buffer), axis=0)   # (240, 256, 3) [0, 255]
+            processed_obs = FrameProcessing.process(max_frame)      # (1, 84, 84), [0.0, 1.0]
 
-        max_frame = np.max(np.stack(self.obs_buffer), axis=0)   # (240, 256, 3) [0, 255]
-        processed_obs = FrameProcessing.process(max_frame)      # (1, 84, 84), [0.0, 1.0]
-
-        self.frames.append(processed_obs)
-        while len(self.frames) < STACK_FRAMES:
             self.frames.append(processed_obs)
+            while len(self.frames) < STACK_FRAMES:
+                self.frames.append(processed_obs)
 
-        self.skip_counter = SKIP_FRAMES
+            state = np.concatenate(self.frames, axis=0)  # (4, 84, 84)
+            self.last_action = self.agent.act(state)
 
-        state = np.concatenate(self.frames, axis=0)  # (4, 84, 84)
-        self.last_action = self.agent.act(state)
-
+        self.frame_count += 1
         return self.last_action
