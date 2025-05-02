@@ -7,7 +7,7 @@ from env_wrapper import FrameProcessing
 class Agent(object):
     def __init__(self):
         self.agent = DQNAgent((4, 84, 84), 12)
-        self.agent.load_model("./models/d3qn_icm_best.pth", eval_mode=True)
+        self.agent.load_model("./models/d3qn_icm_best_5802score.pth", eval_mode=True)
         self.agent.online = torch.jit.script(self.agent.online) # 加速推理
 
         # Skipframe 參數
@@ -40,3 +40,27 @@ class Agent(object):
 
         self.frame_count += 1
         return self.last_action
+
+if __name__ == "__main__":
+    import gym_super_mario_bros
+    from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
+    from nes_py.wrappers import JoypadSpace
+
+    # 創建環境
+    env = gym_super_mario_bros.make('SuperMarioBros-v0')
+    env = JoypadSpace(env, COMPLEX_MOVEMENT)
+
+    # 初始化 Agent
+    agent = Agent()
+
+    # 運行測試
+    observation = env.reset()
+    total_reward = 0
+    done = False
+    while not done:
+        action = agent.act(observation)
+        observation, reward, done, info = env.step(action)
+        total_reward += reward
+        env.render()  # 可視化
+        print(f"Total Reward: {total_reward}")
+        env.close()

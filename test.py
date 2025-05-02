@@ -1,11 +1,11 @@
 from env_wrapper import make_env
-from train import Agent
+from train import Agent as DQNAgent
 
-env = make_env(life_episode=False, random_start=True, level='')
+env = make_env(life_episode=False, random_start=False, level=None)
 
-agent = Agent(env.observation_space.shape, env.action_space.n)
+agent = DQNAgent(env.observation_space.shape, env.action_space.n)
 # agent.load_model("./models/d3qn_per_bolzman.pth", eval_mode=True)
-agent.load_model("./models/d3qn_icm_best.pth", eval_mode=True)
+agent.load_model("./models/d3qn_icm_best_5802score.pth", eval_mode=True)
 
 while True:
     state = env.reset()
