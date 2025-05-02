@@ -473,7 +473,7 @@ def train(
         steps           = 0
         done            = False
         farest_x        = 0
-        flag            = False
+        stage           = 1
         prev_life       = 2
 
         while not done:
@@ -488,8 +488,7 @@ def train(
                 env.render()
 
             farest_x = max(farest_x, info['x_pos'])
-            if info['flag_get']:
-                flag = True
+            stage = info['stage']
             life = info['life']
             if life < prev_life:
                 done = True
@@ -519,7 +518,7 @@ def train(
             f"Episode {episode}\t| "
             f"Steps {steps}\t| "
             f"Reward {episode_reward:.0f}\t| "
-            f"Flag {flag}\t| "
+            f"Stage {stage}\t| "
             f"Farest X {farest_x}"
         )
 
