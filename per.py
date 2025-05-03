@@ -2,6 +2,7 @@ from typing import Dict, Tuple, Deque
 import numpy as np
 from collections import deque
 from segment_tree import SumSegmentTree, MinSegmentTree
+from numba import njit
 
 class ReplayBuffer:
     """A simple numpy replay buffer."""
@@ -21,7 +22,8 @@ class ReplayBuffer:
         self.rews_buf     = np.zeros((size,), dtype=np.float32)
         self.done_buf     = np.zeros((size,), dtype=np.float32)
         self.max_size, self.batch_size = size, batch_size
-        self.ptr, self.size, = 0, 0
+        self.ptr  = 0
+        self.size = 0
 
         # for N-step Learning
         self.n_step_buffer = deque(maxlen=n_step)
@@ -146,7 +148,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         assert len(self) >= self.batch_size
         assert beta > 0
 
-        indices = self._sample_proportional()
+        indices = self._sample_proportional_numba(self.sum_tree, len(self), self.batch_size)
 
         obs = self.obs_buf[indices]
         next_obs = self.next_obs_buf[indices]
@@ -180,20 +182,22 @@ class PrioritizedReplayBuffer(ReplayBuffer):
 
         self.max_priority = max(self.max_priority, np.max(priority))
 
-    def _sample_proportional(self) -> np.ndarray:
+    @njit
+    @staticmethod
+    def _sample_proportional_numba(sum_tree: SumSegmentTree, capacity: int, batch_size: int) -> np.ndarray:
         """Sample indices based on proportions."""
-        indices = np.zeros(self.batch_size, dtype=np.int32)
-        p_total = self.sum_tree.sum(0, len(self) - 1)
-        segment = p_total / self.batch_size
+        indices = np.zeros(batch_size, dtype=np.int32)
+        p_total = sum_tree.sum(0, capacity - 1)
+        segment = p_total / batch_size
 
-        # Generate all upper bounds at once
+        arrange = np.arange(batch_size)
         bounds = np.random.uniform(
-            segment * np.arange(self.batch_size),
-            segment * (np.arange(self.batch_size) + 1)
+            segment * arrange,
+            segment * (arrange + 1)
         )
 
         for i, upperbound in enumerate(bounds):
-            indices[i] = self.sum_tree.retrieve(upperbound)
+            indices[i] = sum_tree.retrieve(upperbound)
 
         return indices
 
