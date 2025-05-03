@@ -18,8 +18,8 @@ class ReplayBuffer:
         self.obs_buf      = np.zeros((size,) + obs_shape, dtype=np.float32)
         self.next_obs_buf = np.zeros((size,) + obs_shape, dtype=np.float32)
         self.acts_buf     = np.zeros((size,), dtype=np.int32)
-        self.rews_buf     = np.zeros((size,), dtype=np.float32)
-        self.done_buf     = np.zeros((size,), dtype=np.float32)
+        self.rews_buf     = np.zeros((size,), dtype=np.float16)
+        self.done_buf     = np.zeros((size,), dtype=np.bool8)
         self.max_size, self.batch_size = size, batch_size
         self.ptr  = 0
         self.size = 0
@@ -62,8 +62,8 @@ class ReplayBuffer:
             obs=np.take(self.obs_buf, idxs, axis=0),
             next_obs=np.take(self.next_obs_buf, idxs, axis=0),
             acts=np.take(self.acts_buf, idxs, axis=0),
-            rews=np.take(self.rews_buf, idxs, axis=0),
-            done=np.take(self.done_buf, idxs, axis=0),
+            rews=np.take(self.rews_buf, idxs, axis=0).astype(np.float32),
+            done=np.take(self.done_buf, idxs, axis=0).astype(np.float32),
             indices=idxs,
         )
 
@@ -152,8 +152,8 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         obs = self.obs_buf[indices]
         next_obs = self.next_obs_buf[indices]
         acts = self.acts_buf[indices]
-        rews = self.rews_buf[indices]
-        done = self.done_buf[indices]
+        rews = self.rews_buf[indices].astype(np.float32)
+        done = self.done_buf[indices].astype(np.float32)
         weights = self._calculate_weight(indices, beta)
 
         return dict(

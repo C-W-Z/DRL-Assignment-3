@@ -15,7 +15,7 @@ from tqdm import tqdm
 # -----------------------------
 # Hyperparameters
 # -----------------------------
-RENDER                  = True
+RENDER                  = False
 MAX_FRAMES              = 10_000_000
 
 # Env Wrappers
@@ -51,11 +51,11 @@ PRIOR_EPS               = 1e-6
 GAMMA_POW_N_STEP = GAMMA ** N_STEP
 
 # Output
-EVAL_INTERVAL           = 10
-SAVE_INTERVAL           = 50
-PLOT_INTERVAL           = 10
-CHECK_PARAM_INTERVAL    = 50
-CHECK_GRAD_INTERVAL     = 50
+EVAL_INTERVAL           = 30
+SAVE_INTERVAL           = 150
+PLOT_INTERVAL           = 30
+CHECK_PARAM_INTERVAL    = 150
+CHECK_GRAD_INTERVAL     = 150
 MODEL_DIR               = "./models"
 PLOT_DIR                = "./plots"
 
@@ -579,7 +579,7 @@ def train(
     progress_bar.close()
 
 if __name__ == '__main__':
-    checkpoint_path='models/d3qn_icm_2000.pth'
+    checkpoint_path='models/d3qn_icm_1500.pth'
 
     agent = Agent((4, 84, 84), 12)
 
@@ -590,25 +590,45 @@ if __name__ == '__main__':
 
     # 輪流練
 
-    if len(agent.rewards) < 200:
-        train(agent, max_episodes=200, level=None, checkpoint_path='models/d3qn_icm_200.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 200:
+    #     train(agent, max_episodes=200, level=None, checkpoint_path='models/d3qn_icm_200.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 400:
-        train(agent, max_episodes=400, level='1-2', checkpoint_path='models/d3qn_icm_400.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 400:
+    #     train(agent, max_episodes=400, level='1-2', checkpoint_path='models/d3qn_icm_400.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 500:
-        train(agent, max_episodes=500, level=None, checkpoint_path='models/d3qn_icm_500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 500:
+    #     train(agent, max_episodes=500, level=None, checkpoint_path='models/d3qn_icm_500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 550:
-        train(agent, max_episodes=550, level='1-2', checkpoint_path='models/d3qn_icm_550.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 600:
+    #     train(agent, max_episodes=600, level='1-2', checkpoint_path='models/d3qn_icm_600.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 1300:
-        train(agent, max_episodes=1300, level=None, checkpoint_path='models/d3qn_icm_1300.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 800:
+    #     train(agent, max_episodes=800, level=None, checkpoint_path='models/d3qn_icm_800.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 1500:
-        train(agent, max_episodes=1500, level='1-2', checkpoint_path='models/d3qn_icm_1500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 900:
+    #     train(agent, max_episodes=900, level='1-1', checkpoint_path='models/d3qn_icm_900.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    # if len(agent.rewards) < 2000:
-    #     train(agent, max_episodes=2000, level=None, checkpoint_path='models/d3qn_icm_2000.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 1300:
+    #     train(agent, max_episodes=1300, level=None, checkpoint_path='models/d3qn_icm_1300.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+    # if len(agent.rewards) < 1500:
+    #     train(agent, max_episodes=1500, level='1-2', checkpoint_path='models/d3qn_icm_1500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    # # if len(agent.rewards) < 2000:
+    # #     train(agent, max_episodes=2000, level='1-3', checkpoint_path='models/d3qn_icm_2000.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    # train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    stages = ['1-1', '1-2', '1-3', None]
+
+    e = 0
+    for _ in range(4):
+        for s in stages:
+            e += 600
+            train(
+                agent,
+                max_episodes=e,
+                level=s,
+                checkpoint_path=f'models/d3qn_icm_{e}.pth',
+                best_checkpoint_path='models/d3qn_icm_best.pth'
+            )
