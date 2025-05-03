@@ -579,7 +579,7 @@ def train(
     progress_bar.close()
 
 if __name__ == '__main__':
-    checkpoint_path='models/d3qn_icm_1300.pth'
+    checkpoint_path='models/d3qn_icm_2000.pth'
 
     agent = Agent((4, 84, 84), 12)
 
@@ -607,5 +607,11 @@ if __name__ == '__main__':
 
     if len(agent.rewards) < 1500:
         train(agent, max_episodes=1500, level='1-2', checkpoint_path='models/d3qn_icm_1500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 2000:
+        train(agent, max_episodes=2000, level=None, checkpoint_path='models/d3qn_icm_2000.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 2300:
+        train(agent, max_episodes=2300, level='1-3', checkpoint_path='models/d3qn_icm_2300.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
     train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')

@@ -2,7 +2,6 @@ from typing import Dict, Tuple, Deque
 import numpy as np
 from collections import deque
 from segment_tree import SumSegmentTree, MinSegmentTree
-from numba import njit
 
 class ReplayBuffer:
     """A simple numpy replay buffer."""
@@ -85,24 +84,6 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
-@njit
-def _sample_proportional_numba(sum_tree: SumSegmentTree, capacity: int, batch_size: int) -> np.ndarray:
-    """Sample indices based on proportions."""
-    indices = np.zeros(batch_size, dtype=np.int32)
-    p_total = sum_tree.sum(0, capacity - 1)
-    segment = p_total / batch_size
-
-    arrange = np.arange(batch_size)
-    bounds = np.random.uniform(
-        segment * arrange,
-        segment * (arrange + 1)
-    )
-
-    for i, upperbound in enumerate(bounds):
-        indices[i] = sum_tree.retrieve(upperbound)
-
-    return indices
-
 class PrioritizedReplayBuffer(ReplayBuffer):
     """Prioritized Replay buffer.
 
@@ -166,7 +147,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         assert len(self) >= self.batch_size
         assert beta > 0
 
-        indices = _sample_proportional_numba(self.sum_tree, len(self), self.batch_size)
+        indices = self._sample_proportional()
 
         obs = self.obs_buf[indices]
         next_obs = self.next_obs_buf[indices]
@@ -184,6 +165,24 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             weights=weights,
             indices=indices,
         )
+
+    def _sample_proportional(self) -> np.ndarray:
+        """Sample indices based on proportions."""
+        indices = np.zeros(self.batch_size, dtype=np.int32)
+        p_total = self.sum_tree.sum(0, len(self) - 1)
+        segment = p_total / self.batch_size
+
+        # Generate all upper bounds at once
+        arrange = np.arange(self.batch_size)
+        bounds = np.random.uniform(
+            segment * arrange,
+            segment * (arrange + 1)
+        )
+
+        for i, upperbound in enumerate(bounds):
+            indices[i] = self.sum_tree.retrieve(upperbound)
+
+        return indices
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray):
         """Update priorities of sampled transitions."""
