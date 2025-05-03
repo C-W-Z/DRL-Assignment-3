@@ -65,10 +65,9 @@ class SegmentTree:
         idx += self.capacity
         self.tree[idx] = val
 
-        idx //= 2
-        while idx >= 1:
-            self.tree[idx] = self.operation(self.tree[2 * idx], self.tree[2 * idx + 1])
-            idx //= 2
+        while idx > 1:
+            idx >>= 1  # Equivalent to idx //= 2
+            self.tree[idx] = self.operation(self.tree[idx << 1], self.tree[(idx << 1) + 1])
 
     def __getitem__(self, idx: int) -> float:
         """Get real value in leaf node of tree."""
@@ -106,12 +105,11 @@ class SumSegmentTree(SegmentTree):
         assert 0 <= upperbound <= self.sum() + 1e-5, "upperbound: {}".format(upperbound)
 
         idx = 1
-
         while idx < self.capacity:  # while non-leaf
-            left = 2 * idx
+            left = idx << 1
             right = left + 1
             if self.tree[left] > upperbound:
-                idx = 2 * idx
+                idx = left
             else:
                 upperbound -= self.tree[left]
                 idx = right

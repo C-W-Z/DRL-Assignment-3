@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Deque
+from typing import Dict, Tuple, Deque
 import numpy as np
 from collections import deque
 from segment_tree import SumSegmentTree, MinSegmentTree
@@ -36,17 +36,13 @@ class ReplayBuffer:
         next_obs: np.ndarray,
         done: bool,
     ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]:
-        transition = (obs, act, rew, next_obs, done)
-        self.n_step_buffer.append(transition)
+        self.n_step_buffer.append((obs, act, rew, next_obs, done))
 
-        # single step transition is not ready
         if len(self.n_step_buffer) < self.n_step:
             return ()
 
         # make a n-step transition
-        rew, next_obs, done = self._get_n_step_info(
-            self.n_step_buffer, self.gamma
-        )
+        rew, next_obs, done = self._get_n_step_info(self.n_step_buffer, self.gamma)
         obs, act = self.n_step_buffer[0][:2]
 
         self.obs_buf[self.ptr] = obs
@@ -61,41 +57,26 @@ class ReplayBuffer:
 
     def sample_batch(self) -> Dict[str, np.ndarray]:
         idxs = np.random.choice(self.size, size=self.batch_size, replace=False)
-
         return dict(
-            obs=self.obs_buf[idxs],
-            next_obs=self.next_obs_buf[idxs],
-            acts=self.acts_buf[idxs],
-            rews=self.rews_buf[idxs],
-            done=self.done_buf[idxs],
-            # for N-step Learning
+            obs=np.take(self.obs_buf, idxs, axis=0),
+            next_obs=np.take(self.next_obs_buf, idxs, axis=0),
+            acts=np.take(self.acts_buf, idxs, axis=0),
+            rews=np.take(self.rews_buf, idxs, axis=0),
+            done=np.take(self.done_buf, idxs, axis=0),
             indices=idxs,
-        )
-
-    def sample_batch_from_idxs(
-        self, idxs: np.ndarray
-    ) -> Dict[str, np.ndarray]:
-        # for N-step Learning
-        return dict(
-            obs=self.obs_buf[idxs],
-            next_obs=self.next_obs_buf[idxs],
-            acts=self.acts_buf[idxs],
-            rews=self.rews_buf[idxs],
-            done=self.done_buf[idxs],
         )
 
     def _get_n_step_info(
         self, n_step_buffer: Deque, gamma: float
-    ) -> Tuple[np.int64, np.ndarray, bool]:
+    ) -> Tuple[float, np.ndarray, bool]:
         """Return n step rew, next_obs, and done."""
-        # info of the last transition
         rew, next_obs, done = n_step_buffer[-1][-3:]
 
-        for transition in reversed(list(n_step_buffer)[:-1]):
+        for transition in list(n_step_buffer)[-2::-1]:  # Iterate in reverse, excluding last
             r, n_o, d = transition[-3:]
-
             rew = r + gamma * rew * (1 - d)
-            next_obs, done = (n_o, d) if d else (next_obs, done)
+            if d:
+                next_obs, done = n_o, d
 
         return rew, next_obs, done
 
@@ -172,7 +153,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         acts = self.acts_buf[indices]
         rews = self.rews_buf[indices]
         done = self.done_buf[indices]
-        weights = np.array([self._calculate_weight(i, beta) for i in indices])
+        weights = self._calculate_weight(indices, beta)
 
         return dict(
             obs=obs,
@@ -193,42 +174,40 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         for idx, priority in zip(indices, priorities):
             # assert priority > 0
             assert 0 <= idx < len(self)
-
-            self.sum_tree[idx] = priority ** self.alpha
-            self.min_tree[idx] = priority ** self.alpha
+            priority_alpha = priority ** self.alpha
+            self.sum_tree[idx] = priority_alpha
+            self.min_tree[idx] = priority_alpha
 
         self.max_priority = max(self.max_priority, np.max(priority))
 
     def _sample_proportional(self) -> np.ndarray:
         """Sample indices based on proportions."""
-        indices = np.zeros((self.batch_size,), dtype=np.int32)
+        indices = np.zeros(self.batch_size, dtype=np.int32)
         p_total = self.sum_tree.sum(0, len(self) - 1)
         segment = p_total / self.batch_size
 
-        for i in range(self.batch_size):
-            a = segment * i
-            b = segment * (i + 1)
+        # Generate all upper bounds at once
+        bounds = np.random.uniform(
+            segment * np.arange(self.batch_size),
+            segment * (np.arange(self.batch_size) + 1)
+        )
 
-            upperbound = np.random.uniform(a, b)
-            idx = self.sum_tree.retrieve(upperbound)
-            indices[i] = idx
+        for i, upperbound in enumerate(bounds):
+            indices[i] = self.sum_tree.retrieve(upperbound)
 
         return indices
 
-    def _calculate_weight(self, idx: int, beta: float):
-        """Calculate the weight of the experience at idx."""
+    def _calculate_weight(self, indices: np.ndarray, beta: float) -> np.ndarray:
         _sum = self.sum_tree.sum()
 
         # get max weight
         p_min = self.min_tree.min() / _sum
         max_weight = (p_min * len(self)) ** (-beta)
 
-        # calculate weights
-        p_sample = self.sum_tree[idx] / _sum
-        weight = (p_sample * len(self)) ** (-beta)
-        weight = weight / max_weight
+        p_samples = np.array([self.sum_tree[idx] for idx in indices]) / _sum
+        weights = (p_samples * len(self)) ** (-beta) / max_weight
 
-        return weight
+        return weights
 
     def get_state(self):
         return {
