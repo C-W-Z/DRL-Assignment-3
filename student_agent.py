@@ -74,7 +74,7 @@ if __name__ == "__main__":
             action = agent.act(observation)
             observation, reward, done, info = env.step(action)
             total_reward += reward
-            # env.render()  # 可視化
+            env.render()  # 可視化
         print(f"Total Reward: {total_reward}")
         env.close()
 

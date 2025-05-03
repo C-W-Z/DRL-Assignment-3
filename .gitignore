@@ -18,4 +18,4 @@ clean_trajectory.py
 train2.py
 duelicm.py
 
-!/models/d3qn_icm_best_7320score.pth
+!/models/d3qn_icm_best_8636score.pth
