@@ -500,7 +500,7 @@ def train(
             agent.frame_idx += 1
             steps += 1
 
-            action = agent.act(state, deterministic=(np.random.rand() >= EPSILON), tau=EXPLORE_TAU)
+            action = agent.act(state, deterministic=(np.random.rand() >= EPSILON))
 
             next_state, reward, done, info = env.step(action)
             episode_reward += reward
@@ -608,14 +608,7 @@ if __name__ == '__main__':
     if len(agent.rewards) < 1500:
         train(agent, max_episodes=1500, level='1-2', checkpoint_path='models/d3qn_icm_1500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
-    if len(agent.rewards) < 2000:
-        train(agent, max_episodes=2000, level=None, checkpoint_path='models/d3qn_icm_2000.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
-
-    if len(agent.rewards) < 2300:
-        EPSILON *= 10
-        EXPLORE_TAU *= 1
-        train(agent, max_episodes=2300, level='1-3', checkpoint_path='models/d3qn_icm_2300.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
-        EPSILON /= 10
-        EXPLORE_TAU /= 1
+    # if len(agent.rewards) < 2000:
+    #     train(agent, max_episodes=2000, level=None, checkpoint_path='models/d3qn_icm_2000.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
     train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
