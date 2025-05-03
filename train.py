@@ -340,9 +340,9 @@ class Agent:
         meta_path = path.replace('.pth', '.meta.pth')
         torch.save({
             'target'           : self.target.state_dict(),
-            # 'icm'              : self.icm.state_dict(),
+            'icm'              : self.icm.state_dict(),
             'optimizer'        : self.optimizer.state_dict(),
-            # 'icm_optimizer'    : self.icm_optimizer.state_dict(),
+            'icm_optimizer'    : self.icm_optimizer.state_dict(),
             'frame_idx'        : self.frame_idx,
             'rewards'          : self.rewards,
             'dqn_losses'       : self.dqn_losses,
@@ -365,9 +365,9 @@ class Agent:
         meta_path = path.replace('.pth', '.meta.pth')
         checkpoint = torch.load(meta_path, map_location=self.device, weights_only=False)
         self.target.load_state_dict(checkpoint['target'])
-        # self.icm.load_state_dict(checkpoint['icm'])
+        self.icm.load_state_dict(checkpoint['icm'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        # self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
+        self.icm_optimizer.load_state_dict(checkpoint['icm_optimizer'])
         self.frame_idx         = checkpoint.get('frame_idx', 0)
         self.rewards           = checkpoint.get('rewards', [])
         self.dqn_losses        = checkpoint.get('dqn_losses', [])
