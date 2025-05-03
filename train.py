@@ -15,7 +15,7 @@ from tqdm import tqdm
 # -----------------------------
 # Hyperparameters
 # -----------------------------
-RENDER                  = False
+RENDER                  = True
 MAX_FRAMES              = 10_000_000
 
 # Env Wrappers
@@ -86,17 +86,17 @@ class ICM(nn.Module):
         )
 
     def forward(self, features, next_features, actions):
-        phi           = self.encoder(features)
-        phi_next      = self.encoder(next_features)
+        feature              = self.encoder(features)
+        next_feature         = self.encoder(next_features)
 
-        inv_input     = torch.cat([phi, phi_next], dim=1)
-        pred_action   = self.inverse_model(inv_input)
+        inverse_input        = torch.cat([feature, next_feature], dim=1)
+        predict_action       = self.inverse_model(inverse_input)
 
-        action_onehot = F.one_hot(actions, num_classes=pred_action.size(-1)).float()
-        forward_input = torch.cat([phi, action_onehot], dim=1)
-        pred_phi_next = self.forward_model(forward_input)
+        action_onehot        = F.one_hot(actions, num_classes=predict_action.size(-1)).float()
+        forward_input        = torch.cat([feature, action_onehot], dim=1)
+        predict_next_feature = self.forward_model(forward_input)
 
-        return pred_action, pred_phi_next, phi_next
+        return predict_action, predict_next_feature, next_feature
 
 # ------- Double Dueling Deep Recurrent Q Network -------
 
@@ -288,9 +288,9 @@ class Agent:
         # ----- ICM -----
         features        = self.online.feature_layer(states).detach()
         next_features   = self.online.feature_layer(next_states).detach()
-        pred_action, pred_phi_next, phi_next = self.icm(features, next_features, actions)
-        inverse_loss    = self.inverse_criterion(pred_action, actions)
-        forward_loss    = self.forward_criterion(pred_phi_next, phi_next)
+        predict_action, predict_next_feature, next_feature = self.icm(features, next_features, actions)
+        inverse_loss    = self.inverse_criterion(predict_action, actions)
+        forward_loss    = self.forward_criterion(predict_next_feature, next_feature)
         icm_loss        = (1 - ICM_BETA) * inverse_loss + ICM_BETA * forward_loss
         with torch.no_grad():
             intrinsic_reward = ICM_ETA * forward_loss.detach()
@@ -579,7 +579,7 @@ def train(
     progress_bar.close()
 
 if __name__ == '__main__':
-    checkpoint_path='models/d3qn_icm_450.pth'
+    checkpoint_path='models/d3qn_icm_1300.pth'
 
     agent = Agent((4, 84, 84), 12)
 
@@ -588,7 +588,7 @@ if __name__ == '__main__':
     if os.path.isfile(checkpoint_path):
         agent.load_model(checkpoint_path)
 
-    # 輪流練200episode
+    # 輪流練
 
     if len(agent.rewards) < 200:
         train(agent, max_episodes=200, level=None, checkpoint_path='models/d3qn_icm_200.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
@@ -601,5 +601,11 @@ if __name__ == '__main__':
 
     if len(agent.rewards) < 550:
         train(agent, max_episodes=550, level='1-2', checkpoint_path='models/d3qn_icm_550.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 1300:
+        train(agent, max_episodes=1300, level=None, checkpoint_path='models/d3qn_icm_1300.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
+
+    if len(agent.rewards) < 1500:
+        train(agent, max_episodes=1500, level='1-2', checkpoint_path='models/d3qn_icm_1500.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
 
     train(agent, max_episodes=10000, level=None, checkpoint_path='models/d3qn_icm.pth', best_checkpoint_path='models/d3qn_icm_best.pth')
