@@ -16,7 +16,7 @@ env = FrameStack(env, k=4)
 
 agent = DQNAgent(env.observation_space.shape, env.action_space.n)
 # agent.load_model("./models/d3qn_per_bolzman.pth", eval_mode=True)
-agent.load_model("./models/d3qn_icm_best_7320score.pth", eval_mode=True)
+agent.load_model("./models/d3qn_icm_best_8636score.pth", eval_mode=True)
 
 while True:
     state = env.reset()

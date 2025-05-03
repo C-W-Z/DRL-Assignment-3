@@ -7,7 +7,7 @@ from env_wrapper import FrameProcessing
 class Agent(object):
     def __init__(self):
         self.agent = DQNAgent((4, 84, 84), 12)
-        self.agent.load_model("./models/d3qn_icm_best_7320score.pth", eval_mode=True)
+        self.agent.load_model("./models/d3qn_icm_best_8636score.pth", eval_mode=True)
         self.agent.online = torch.jit.script(self.agent.online) # 加速推理
 
         # Skipframe 參數

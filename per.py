@@ -85,6 +85,24 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return self.size
 
+@njit
+def _sample_proportional_numba(sum_tree: SumSegmentTree, capacity: int, batch_size: int) -> np.ndarray:
+    """Sample indices based on proportions."""
+    indices = np.zeros(batch_size, dtype=np.int32)
+    p_total = sum_tree.sum(0, capacity - 1)
+    segment = p_total / batch_size
+
+    arrange = np.arange(batch_size)
+    bounds = np.random.uniform(
+        segment * arrange,
+        segment * (arrange + 1)
+    )
+
+    for i, upperbound in enumerate(bounds):
+        indices[i] = sum_tree.retrieve(upperbound)
+
+    return indices
+
 class PrioritizedReplayBuffer(ReplayBuffer):
     """Prioritized Replay buffer.
 
@@ -148,7 +166,7 @@ class PrioritizedReplayBuffer(ReplayBuffer):
         assert len(self) >= self.batch_size
         assert beta > 0
 
-        indices = self._sample_proportional_numba(self.sum_tree, len(self), self.batch_size)
+        indices = _sample_proportional_numba(self.sum_tree, len(self), self.batch_size)
 
         obs = self.obs_buf[indices]
         next_obs = self.next_obs_buf[indices]
@@ -181,25 +199,6 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             self.min_tree[idx] = priority_alpha
 
         self.max_priority = max(self.max_priority, np.max(priority))
-
-    @njit
-    @staticmethod
-    def _sample_proportional_numba(sum_tree: SumSegmentTree, capacity: int, batch_size: int) -> np.ndarray:
-        """Sample indices based on proportions."""
-        indices = np.zeros(batch_size, dtype=np.int32)
-        p_total = sum_tree.sum(0, capacity - 1)
-        segment = p_total / batch_size
-
-        arrange = np.arange(batch_size)
-        bounds = np.random.uniform(
-            segment * arrange,
-            segment * (arrange + 1)
-        )
-
-        for i, upperbound in enumerate(bounds):
-            indices[i] = sum_tree.retrieve(upperbound)
-
-        return indices
 
     def _calculate_weight(self, indices: np.ndarray, beta: float) -> np.ndarray:
         _sum = self.sum_tree.sum()

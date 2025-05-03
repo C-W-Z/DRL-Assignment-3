@@ -42,7 +42,7 @@ EXPLORE_TAU             = 1.0
 # Prioritized Replay Buffer
 MEMORY_SIZE             = 30_000
 BATCH_SIZE              = 64
-GAMMA                   = 0.9
+GAMMA                   = 0.9 # 重生點的存在導致累積reward不是完全連續的，因此降低gamma
 N_STEP                  = 5
 ALPHA                   = 0.6
 BETA_START              = 0.4
